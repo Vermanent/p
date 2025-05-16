@@ -52,7 +52,7 @@ end
 -- Fill solid rock
 print("Filling terrain with rock...")
 Terrain:FillBlock(CFrame.new(center), Config.RegionSize, Config.RockMaterial)
-task.wait(1) -- Give time for the fill operation to complete
+task.wait(0.5) -- Reduced wait time to improve performance
 
 local function fractalNoise(x, y, z)
 	local sum = 0
@@ -82,49 +82,74 @@ local processed = 0
 local total = (xCount + 1) * (yCount + 1) * (zCount + 1)
 local startTime = os.clock()
 
--- First pass: Carve out primary caves
+-- First pass: Carve out primary caves - MODIFIED for less carving
 print("Phase 1: Carving primary caves...")
-for ix = 0, xCount do
-	for iy = 0, yCount do
-		for iz = 0, zCount do
-			local wp = gridToWorld(ix, iy, iz)
+-- Process cells in batches for better performance
+local batchSize = 10
+for ix = 0, xCount, batchSize do
+	for iy = 0, yCount, batchSize do
+		for iz = 0, zCount, batchSize do
+			-- Process this batch
+			for ox = 0, batchSize - 1 do
+				if ix + ox > xCount then continue end
+				for oy = 0, batchSize - 1 do
+					if iy + oy > yCount then continue end
+					for oz = 0, batchSize - 1 do
+						if iz + oz > zCount then continue end
 
-			-- Modified height bias: More caves near top and bottom
-			-- This creates a U-shaped distribution - more caves at top and bottom, fewer in middle
-			local heightRatio = wp.Y / Config.RegionSize.Y
-			local heightBias
+						local cx, cy, cz = ix + ox, iy + oy, iz + oz
+						local wp = gridToWorld(cx, cy, cz)
 
-			if heightRatio < 0.3 or heightRatio > 0.7 then
-				-- More caves near surface and deep underground
-				heightBias = -0.1
-			else
-				-- Fewer caves in middle layers
-				heightBias = 0.05
+						-- Modified height bias: More caves in middle layers, less on edges
+						local heightRatio = wp.Y / Config.RegionSize.Y
+						local heightBias
+
+						if heightRatio < 0.15 or heightRatio > 0.85 then
+							-- Few caves near surface and deep underground
+							heightBias = 0.15
+						else
+							-- More caves in middle layers
+							heightBias = -0.05
+						end
+
+						-- Add distance bias to create more natural cave patterns
+						local distanceFromCenter = ((wp - center) / Config.RegionSize).Magnitude * 2
+						local distanceBias = math.min(distanceFromCenter * 0.1, 0.1)
+
+						-- Sample noise for cave determination
+						local density = fractalNoise(wp.X, wp.Y, wp.Z) + heightBias + distanceBias
+
+						-- Adjust threshold check - ONLY carve if below threshold
+						if density < Config.Threshold then
+							-- Use smaller radius for more natural cave shapes
+							local radiusBase = cell * 0.5  -- Reduced base radius
+							local radiusVariation = cell * 0.3 * Noise:GetValue(wp.X/10, wp.Y/10, wp.Z/10)
+							local radius = radiusBase + radiusVariation
+
+							-- Add some variation to cave sizes
+							local caveSizeMultiplier = 1.0 + 0.3 * Noise:GetValue(wp.X/25, wp.Y/25, wp.Z/25)
+							radius = radius * caveSizeMultiplier
+
+							Terrain:FillBall(wp, radius, Enum.Material.Air)
+
+							-- Mark this cell as carved in our grid
+							caveGrid[cx][cy][cz] = true
+						end
+
+						processed = processed + 1
+					end
+				end
 			end
 
-			local density = fractalNoise(wp.X, wp.Y, wp.Z) + heightBias
-
-			if density < Config.Threshold then
-				-- Use FillBall for smooth caves, radius varies for natural shape
-				local radiusBase = cell * 0.7
-				local radiusVariation = cell * 0.5 * Noise:GetValue(wp.X/10, wp.Y/10, wp.Z/10)
-				local radius = radiusBase + radiusVariation
-
-				Terrain:FillBall(wp, radius, Enum.Material.Air)
-
-				-- Mark this cell as carved in our grid
-				caveGrid[ix][iy][iz] = true
-			end
-
-			processed = processed + 1
-			if processed % 5000 == 0 then
+			-- Update progress occasionally
+			if processed % 15000 == 0 then
 				local elapsed = os.clock() - startTime
 				local progress = processed / total
 				local etaSeconds = elapsed / progress - elapsed
 
 				print(string.format("Primary carving: %.2f%% (ETA: %.1f seconds)", 
 					progress * 100, etaSeconds))
-				task.wait() -- Yield to prevent script timeout
+				task.wait(0.01) -- Reduced yield time to improve performance
 			end
 		end
 	end
@@ -185,15 +210,15 @@ if Config.EnableConnectivity then
 			)
 			local controlPoint = midpoint + randomOffset
 
-			-- Carve tunnel along path
+			-- Carve tunnel along path - THINNER TUNNELS
 			local steps = math.ceil((p1 - p2).Magnitude / (cell * 0.5))
 			for t = 0, 1, 1/steps do
 				-- Bezier formula: B(t) = (1-t)^2 * P1 + 2(1-t)t * CP + t^2 * P2
 				local mt = 1 - t
 				local point = (mt * mt * p1) + (2 * mt * t * controlPoint) + (t * t * p2)
 
-				-- Carve with varied tunnel size
-				local tunnelSize = cell * (0.8 + 0.4 * math.sin(t * math.pi))
+				-- Carve with smaller tunnel size
+				local tunnelSize = cell * (0.6 + 0.3 * math.sin(t * math.pi)) -- Reduced size
 				Terrain:FillBall(point, tunnelSize, Enum.Material.Air)
 
 				-- Update grid
@@ -208,7 +233,7 @@ if Config.EnableConnectivity then
 
 		if i % 10 == 0 then
 			print(string.format("Creating connections: %.1f%%", i / Config.ConnectivityDensity * 100))
-			task.wait()
+			task.wait(0.01) -- Reduced wait time
 		end
 	end
 end
@@ -218,7 +243,7 @@ if Config.RemoveFloatingBlocks then
 	print("Phase 3: Removing floating terrain...")
 
 	-- Sample grid with larger step to identify floating terrain
-	local checkStep = 4
+	local checkStep = 6 -- Increased step size for better performance
 	processed = 0
 
 	for ix = 0, xCount, checkStep do
@@ -313,7 +338,7 @@ if Config.RemoveFloatingBlocks then
 			if processed % 200 == 0 then
 				print(string.format("Fixing floating terrain: %.1f%%", 
 					processed / ((xCount/checkStep) * (zCount/checkStep)) * 100))
-				task.wait()
+				task.wait(0.01) -- Reduced wait time
 			end
 		end
 	end
@@ -329,8 +354,8 @@ for i = 1, Config.SurfaceCaveCount do
 
 	local entrancePos = Vector3.new(surfX, surfY, surfZ)
 
-	-- Create entrance tunnel
-	local tunnelLength = 50 + math.random(20, 80)
+	-- Create entrance tunnel - SHORTER ENTRANCE TUNNELS
+	local tunnelLength = 30 + math.random(15, 50) -- Reduced length
 	local tunnelDir = Vector3.new(
 		(math.random() - 0.5) * 0.4,
 		-1, -- Mostly downward
@@ -346,8 +371,8 @@ for i = 1, Config.SurfaceCaveCount do
 			continue
 		end
 
-		-- Variable tunnel size that gets larger as it goes deeper
-		local tunnelRadius = Config.SurfaceCaveSize * (0.5 + 0.5 * (t/tunnelLength))
+		-- Variable tunnel size that gets larger as it goes deeper - SMALLER ENTRANCES
+		local tunnelRadius = Config.SurfaceCaveSize * 0.7 * (0.5 + 0.5 * (t/tunnelLength)) -- Reduced size
 		-- Add some noise to the tunnel shape
 		local noiseVal = Noise:GetValue(point.X/20, point.Y/20, point.Z/20)
 		tunnelRadius = tunnelRadius * (0.8 + 0.4 * noiseVal)
@@ -362,26 +387,26 @@ for i = 1, Config.SurfaceCaveCount do
 			caveGrid[gx][gy][gz] = true
 		end
 
-		-- Add some horizontal branches occasionally
-		if math.random() < 0.1 then
+		-- Add some horizontal branches occasionally - FEWER BRANCHES
+		if math.random() < 0.05 then -- Reduced chance
 			local branchDir = Vector3.new(
 				math.random() - 0.5,
 				(math.random() - 0.5) * 0.3, -- Mostly horizontal
 				math.random() - 0.5
 			).Unit
 
-			local branchLength = 10 + math.random(5, 20)
+			local branchLength = 8 + math.random(3, 12) -- Shorter branches
 
 			for b = 0, branchLength, 2 do
 				local branchPoint = point + (branchDir * b)
-				local branchRadius = tunnelRadius * (1 - b/branchLength) * 0.7
+				local branchRadius = tunnelRadius * (1 - b/branchLength) * 0.6 -- Smaller branches
 				Terrain:FillBall(branchPoint, branchRadius, Enum.Material.Air)
 			end
 		end
 	end
 
-	if i % 2 == 0 then
-		task.wait() -- Prevent script timeout
+	if i % 3 == 0 then -- Process more before yielding
+		task.wait(0.01) -- Prevent script timeout with minimal delay
 	end
 end
 
@@ -398,7 +423,7 @@ for i = 1, Config.WaterPoolCount do
 	local tries = 0
 	local found = false
 
-	while not found and tries < 50 do
+	while not found and tries < 30 do -- Reduced tries for performance
 		poolX = math.random(20, Config.RegionSize.X - 20)
 		poolZ = math.random(20, Config.RegionSize.Z - 20)
 
@@ -432,8 +457,8 @@ for i = 1, Config.WaterPoolCount do
 
 	if found then
 		-- Create water pool
-		local poolSize = 30 + math.random(10, 50)
-		local poolDepth = 3 + math.random(2, 8)
+		local poolSize = 20 + math.random(8, 35) -- Smaller pools
+		local poolDepth = 3 + math.random(2, 6)
 
 		-- Create pool container (ensure it has walls)
 		for dx = -poolSize, poolSize, 3 do
@@ -463,62 +488,65 @@ for i = 1, Config.WaterPoolCount do
 		print("Created water pool at level " .. waterLevel)
 	end
 
-	task.wait() -- Prevent script timeout
+	task.wait(0.01) -- Reduced wait time
 end
 
 -- Add some randomized ore veins
 print("Adding ore deposits...")
-for i = 1, Config.OreDepositCount do
-	local pos = Vector3.new(
-		math.random() * Config.RegionSize.X,
-		math.random(20, Config.RegionSize.Y - 20),
-		math.random() * Config.RegionSize.Z
-	)
+-- Process in batches for better performance
+local batchCount = 10
+local oresPerBatch = math.ceil(Config.OreDepositCount / batchCount)
 
-	-- Check if near cave wall
-	local gx, gy, gz = worldToGrid(pos)
-	local isNearCave = false
+for batch = 1, batchCount do
+	for i = 1, oresPerBatch do
+		local pos = Vector3.new(
+			math.random() * Config.RegionSize.X,
+			math.random(20, Config.RegionSize.Y - 20),
+			math.random() * Config.RegionSize.Z
+		)
 
-	if isValidGridPos(gx, gy, gz) then
-		for dx = -2, 2 do
-			for dy = -2, 2 do
-				for dz = -2, 2 do
-					local nx, ny, nz = gx + dx, gy + dy, gz + dz
-					if isValidGridPos(nx, ny, nz) and
-						caveGrid[nx] and caveGrid[nx][ny] and caveGrid[nx][ny][nz] then
-						isNearCave = true
-						break
+		-- Check if near cave wall
+		local gx, gy, gz = worldToGrid(pos)
+		local isNearCave = false
+
+		if isValidGridPos(gx, gy, gz) then
+			for dx = -2, 2 do
+				for dy = -2, 2 do
+					for dz = -2, 2 do
+						local nx, ny, nz = gx + dx, gy + dy, gz + dz
+						if isValidGridPos(nx, ny, nz) and
+							caveGrid[nx] and caveGrid[nx][ny] and caveGrid[nx][ny][nz] then
+							isNearCave = true
+							break
+						end
 					end
+					if isNearCave then break end
 				end
 				if isNearCave then break end
 			end
-			if isNearCave then break end
-		end
-	end
-
-	if isNearCave then
-		local oreSize = 3 + math.random() * Config.MaxOreSize
-		local oreMaterial
-		local roll = math.random()
-
-		if roll < 0.2 then
-			oreMaterial = Enum.Material.CobbleStone -- Common
-		elseif roll < 0.5 then
-			oreMaterial = Enum.Material.Basalt -- Uncommon
-		elseif roll < 0.8 then
-			oreMaterial = Enum.Material.Slate -- Uncommon
-		elseif roll < 0.95 then
-			oreMaterial = Enum.Material.Marble -- Rare
-		else
-			oreMaterial = Enum.Material.DiamondPlate -- Very rare
 		end
 
-		Terrain:FillBall(pos, oreSize, oreMaterial)
-	end
+		if isNearCave then
+			local oreSize = 3 + math.random() * Config.MaxOreSize
+			local oreMaterial
+			local roll = math.random()
 
-	if i % 20 == 0 then
-		task.wait() -- Prevent script timeout
+			if roll < 0.2 then
+				oreMaterial = Enum.Material.CobbleStone -- Common
+			elseif roll < 0.5 then
+				oreMaterial = Enum.Material.Basalt -- Uncommon
+			elseif roll < 0.8 then
+				oreMaterial = Enum.Material.Slate -- Uncommon
+			elseif roll < 0.95 then
+				oreMaterial = Enum.Material.Marble -- Rare
+			else
+				oreMaterial = Enum.Material.DiamondPlate -- Very rare
+			end
+
+			Terrain:FillBall(pos, oreSize, oreMaterial)
+		end
 	end
+	task.wait(0.01) -- Yield after each batch
 end
 
 print("Cave system generation complete!")
