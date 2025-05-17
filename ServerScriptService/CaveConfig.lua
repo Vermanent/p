@@ -17,14 +17,14 @@ Config.NoiseScale    = 0.015  -- Adjusted for more defined cave structures
 
 -- Number of noise octaves for fractal Brownian motion
 -- More octaves = more detail but slower generation
-Config.Octaves       = 3  -- Reduced for performance
+Config.Octaves       = 4     -- Increased from 3 for more detailed cave shapes
 
 -- Frequency multiplier per octave
 Config.Lacunarity    = 2.0
 
 -- Amplitude multiplier per octave
 -- Lower values = smoother caves; higher values = more chaotic caves
-Config.Persistence   = 0.45  -- Reduced for smoother caves
+Config.Persistence   = 0.5   -- Increased from 0.45 for slightly more chaotic, natural caves
 
 -- Seed for random permutation - change for different cave layouts
 Config.Seed          = 67890
@@ -34,12 +34,12 @@ Config.RockMaterial  = Enum.Material.Granite
 
 -- Enable cave connectivity pass
 Config.EnableConnectivity = true
-Config.ConnectivityDensity = 12  -- Increased for better connected caves
+Config.ConnectivityDensity = 20  -- Increased from 12 for more connecting tunnels
 
 -- Enable anti-floating terrain system
 Config.RemoveFloatingBlocks = true
 Config.FloatingCheckRadius = 30
-Config.MinSupportedSize = 35  -- Reduced slightly
+Config.MinSupportedSize = 25     -- Reduced from 35 to catch smaller floating segments
 
 -- Water settings - Multiple water bodies
 Config.WaterPoolCount = 6
@@ -51,7 +51,7 @@ Config.OreDepositCount = 100
 Config.MaxOreSize = 10
 
 -- Surface caves (entrance) settings
-Config.SurfaceCaveCount = 8  -- Reduced slightly
-Config.SurfaceCaveSize = 15  -- Smaller entrances
+Config.SurfaceCaveCount = 12  -- Increased from 8 for more entrances
+Config.SurfaceCaveSize = 20  -- Increased from 15 for larger, noticeable entrances
 
 return Config
