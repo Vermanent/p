@@ -1,6 +1,5 @@
 -- ModuleScript: CaveConfig
 -- Path: ServerScriptService/CaveConfig.lua
--- VERSION FOR DEBUGGING/STRESS TESTING (Full run of V6.0 CaveGenerator)
 local Config = {}
 
 --------------------------------------------------------------------------------
@@ -9,7 +8,7 @@ local Config = {}
 Config.Seed = 67896 -- Keep your seed for consistency, or change to test variations
 Config.DebugMode = true -- Set to true for VERY verbose logging from Perlin & your prints
 
-Config.RegionSize    = Vector3.new(1024, 512, 1024) 
+Config.RegionSize    = Vector3.new(512, 256, 512) 
 Config.CellSize      = 4 -- can reduce for higher res
 Config.RockMaterial  = Enum.Material.Slate
 
@@ -125,5 +124,23 @@ Config.FBM_DefaultLacunarity = 2.0
 -- You can add other defaults here for DomainWarp, GuidedFBM etc. from Perlin.lua if you start using them without passing all params.
 Config.P1_DomainWarp_Strength = 25       -- Example if you add domain warp to Phase 1
 Config.P1_DomainWarp_FrequencyFactor = 0.4 -- Example
+
+-- Debug Settings
+Config.FloodFillContext_MaxInitialDebugAttempts = 3 -- How many flood fill *attempts* get detailed logs from _floodFillSearch
+Config.FloodFillContext_MaxInitialComponentLogs = 3 -- How many actual *components found* get a finish log from _floodFillSearch
+Config.FloodFillContext_LargeComponentThreshold = 1000 -- Size above which a component finish is logged
+Config.FloodFillContext_SmallComponentThreshold = 10   -- Size below which (but >0) a component finish is logged
+Config.FloodFillLogFirstAirCellFound = true -- Whether to log the first air cell found by iteration in _findAirComponents
+Config.FloodFillMaxNilCellLogs = 3 -- Max NIL cells to log during _findAirComponents iteration
+Config.FloodFillZSliceLogDivisor = 10 -- Affects frequency of Z-slice progress print in _findAirComponents (e.g., 10 = every 10%)
+-- For P8 Z-Slice INFO message frequency:
+Config.GreedyMesherZSliceLogDivisor_DebugMode = 20  -- Example: If DebugMode=true, print Z-slice info every 20th Z-slice.
+-- Set to 1 if you want it every slice when DebugMode=true.
+Config.GreedyMesherZSliceLogDivisor_ReleaseMode = 5 -- Example: If DebugMode=false, aim for roughly 5 Z-slice info prints total.
+-- Set to 2 for very few (start, mid, end).
+
+-- Other P8 optional configs:
+Config.GreedyMesherInnerYieldThreshold = 25000          -- Default if not set
+Config.GreedyMesherCallCountLogFrequency = 10000       -- Default if not set, for the other P8 debug print
 
 return Config
