@@ -307,10 +307,26 @@ local function Phase1_InitialCaveFormation()
 		print("Phase 1 INFO: Domain Warping is DISABLED.")
 	end
 
+	-- [[[ MODIFICATION START ]]]
+	-- Surface Adaptive FBM Configuration Print
+	if CaveConfig.P1_UseSurfaceAdaptiveFBM then
+		print("Phase 1 INFO: Surface Adaptive FBM for Detailed Pass is ENABLED.")
+		print(string.format("    Adaptive Params: TargetThresh=%.3f, NearOct=%d, FarOct=%d, TransRange=%.3f",
+			CaveConfig.P1_Adaptive_TargetThreshold,
+			CaveConfig.P1_Adaptive_NearSurfaceOctaves,
+			CaveConfig.P1_Adaptive_FarSurfaceOctaves,
+			CaveConfig.P1_Adaptive_TransitionRange))
+		print(string.format("    (Using P1_Octaves: %d as maxOctaves, P1_NoiseScale: %.4f as frequency for adaptive FBM)",
+			CaveConfig.P1_Octaves, CaveConfig.P1_NoiseScale))
+	else
+		print("Phase 1 INFO: Surface Adaptive FBM for Detailed Pass is DISABLED (using FBM_Base via localFractalNoise).")
+	end
+	-- [[[ MODIFICATION END ]]]
+
 	local startTime = os.clock()
 	local airCellsSetInP1 = 0
-	local broadPassSetToSolidCount = 0 -- Counter for cells set by broad pass
-	local exampleFinalDensityForSlice -- Remains for detailed pass sampling
+	local broadPassSetToSolidCount = 0 
+	local exampleFinalDensityForSlice 
 
 	for z = 1, gridSizeZ do
 		for y = 1, gridSizeY do
@@ -328,23 +344,22 @@ local function Phase1_InitialCaveFormation()
 					local broadNoiseVal = localFractalNoise(worldX_orig, worldY_orig, worldZ_orig,
 						broadNoiseEffectiveScale,
 						CaveConfig.P1_BroadStructure_Octaves,
-						CaveConfig.P1_Persistence, -- Using main persistence
-						CaveConfig.P1_Lacunarity)  -- Using main lacunarity
+						CaveConfig.P1_Persistence, 
+						CaveConfig.P1_Lacunarity)  
 
-					-- If broad noise suggests a solid area, mark as SOLID and skip detailed calculation
 					if broadNoiseVal > CaveConfig.P1_BroadStructure_Threshold then
 						grid:set(x, y, z, SOLID)
 						skipDetailedCalculation = true
 						broadPassSetToSolidCount = broadPassSetToSolidCount + 1
 
-						if CaveConfig.DebugMode and broadPassSetToSolidCount < 15 and broadPassSetToSolidCount % 1 == 0 then -- Log a few initial ones
+						if CaveConfig.DebugMode and broadPassSetToSolidCount < 15 and broadPassSetToSolidCount % 1 == 0 then 
 							print(string.format("P1 HIERARCHICAL: Cell(%d,%d,%d) SOLID by Broad Pass. Noise=%.4f (Thresh=%.3f)",
 								x,y,z, broadNoiseVal, CaveConfig.P1_BroadStructure_Threshold))
 						end
 					end
 				end
 
-				-- Detailed Noise Pass (Domain Warped or Regular)
+				-- Detailed Noise Pass (Domain Warped or Regular, potentially Surface Adaptive)
 				if not skipDetailedCalculation then
 					local worldX_input = worldX_orig
 					local worldY_input = worldY_orig
@@ -355,7 +370,7 @@ local function Phase1_InitialCaveFormation()
 							worldX_orig, worldY_orig, worldZ_orig,
 							CaveConfig.P1_DomainWarp_FrequencyFactor,
 							CaveConfig.P1_DomainWarp_Strength,
-							nil, -- Use default Perlin.Noise_Raw
+							nil, 
 							CaveConfig.P1_DomainWarp_Octaves,
 							CaveConfig.P1_DomainWarp_Persistence,
 							CaveConfig.P1_DomainWarp_Lacunarity
@@ -364,7 +379,7 @@ local function Phase1_InitialCaveFormation()
 						worldY_input = warpedY
 						worldZ_input = warpedZ
 
-						if CaveConfig.DebugMode and x <= 1 and y <= 1 and z <= 1 then -- Existing DW debug
+						if CaveConfig.DebugMode and x <= 1 and y <= 1 and z <= 1 then 
 							local iterationNum = (z-1)*gridSizeX*gridSizeY + (y-1)*gridSizeX + x
 							if iterationNum <= 2 then 
 								print(string.format("P1 DW DEBUG: Cell(%d,%d,%d) Orig(%0.2f,%0.2f,%0.2f) -> Warped(%0.2f,%0.2f,%0.2f)",
@@ -373,11 +388,37 @@ local function Phase1_InitialCaveFormation()
 						end
 					end
 
-					local noiseVal = localFractalNoise(worldX_input, worldY_input, worldZ_input,
-						CaveConfig.P1_NoiseScale,
-						CaveConfig.P1_Octaves,
-						CaveConfig.P1_Persistence,
-						CaveConfig.P1_Lacunarity)
+					-- [[[ MODIFICATION START ]]]
+					local noiseVal
+					if CaveConfig.P1_UseSurfaceAdaptiveFBM then
+						noiseVal = Perlin.FBM_SurfaceAdaptive(
+							worldX_input, -- Already (potentially) domain-warped coordinates
+							worldY_input,
+							worldZ_input,
+							CaveConfig.P1_Octaves,                -- maxOctaves (the overall cap for detail)
+							CaveConfig.P1_Persistence,
+							CaveConfig.P1_Lacunarity,
+							CaveConfig.P1_NoiseScale,             -- frequency
+							1.0,                                  -- amplitude (consistent with FBM_Base's default usage in localFractalNoise)
+							CaveConfig.P1_Adaptive_TargetThreshold,
+							CaveConfig.P1_Adaptive_NearSurfaceOctaves,
+							CaveConfig.P1_Adaptive_FarSurfaceOctaves,
+							CaveConfig.P1_Adaptive_TransitionRange
+							-- noiseFunc (default nil is fine, Perlin.Noise_Raw will be used internally)
+						)
+					else
+						-- Original FBM_Base call via localFractalNoise
+						noiseVal = localFractalNoise(
+							worldX_input, 
+							worldY_input, 
+							worldZ_input,
+							CaveConfig.P1_NoiseScale,
+							CaveConfig.P1_Octaves,
+							CaveConfig.P1_Persistence,
+							CaveConfig.P1_Lacunarity
+						)
+					end
+					-- [[[ MODIFICATION END ]]]
 
 					local hBias = localHeightBias(y, gridSizeY)
 					local dBias = localDistanceToCenterBias(x, y, z, gridSizeX, gridSizeY, gridSizeZ, CaveConfig.P1_DistanceBias_Max)
@@ -386,7 +427,7 @@ local function Phase1_InitialCaveFormation()
 					local finalDensity = noiseVal + hBias + dBias + vConnBias
 
 					if x == math.floor(gridSizeX/2) and y == math.floor(gridSizeY/2) then
-						exampleFinalDensityForSlice = finalDensity -- Keep for detailed pass sample
+						exampleFinalDensityForSlice = finalDensity 
 					end
 
 					if finalDensity < CaveConfig.Threshold then
@@ -402,17 +443,16 @@ local function Phase1_InitialCaveFormation()
 			end -- End for x
 		end -- End for y
 
-		-- Existing Z-slice debug print
 		if CaveConfig.DebugMode and z % 20 == 0 then
 			local status_msg = string.format("P1 DEBUG: Z-slice %d done.", z)
-			if exampleFinalDensityForSlice then -- Will only be set if at least one cell in the slice went through detailed pass
+			if exampleFinalDensityForSlice then 
 				status_msg = string.format("P1 DEBUG: Z-slice %d. Sample DetailedDensity(mid): %.4f (Thresh %.4f)", z, exampleFinalDensityForSlice, CaveConfig.Threshold)
 			end
 			if CaveConfig.P1_UseHierarchicalNoise then
 				status_msg = status_msg .. string.format(" BroadSolid: %d.", broadPassSetToSolidCount)
 			end
 			print(status_msg)
-			exampleFinalDensityForSlice = nil -- Reset for next sampled slice
+			exampleFinalDensityForSlice = nil 
 		end
 	end -- End for z
 
