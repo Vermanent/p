@@ -285,6 +285,19 @@ local mainCaveCellIndices = {}
 -- =============================================================================
 local function Phase1_InitialCaveFormation()
 	print("Phase 1 INFO: Starting initial cave structure...")
+
+	-- Hierarchical Noise Configuration Print
+	if CaveConfig.P1_UseHierarchicalNoise then
+		print("Phase 1 INFO: Hierarchical Noise (Broad Structure Pass) is ENABLED.")
+		print(string.format("    Broad Pass Params: ScaleFactor=%.3f, Octaves=%d, Threshold=%.3f",
+			CaveConfig.P1_BroadStructure_NoiseScaleFactor,
+			CaveConfig.P1_BroadStructure_Octaves,
+			CaveConfig.P1_BroadStructure_Threshold))
+	else
+		print("Phase 1 INFO: Hierarchical Noise (Broad Structure Pass) is DISABLED.")
+	end
+
+	-- Domain Warping Configuration Print
 	if CaveConfig.P1_UseDomainWarp then
 		print("Phase 1 INFO: Domain Warping is ENABLED.")
 		print(string.format("    DW Params: Strength=%.2f, FreqFactor=%.3f, Octaves=%d, Pers=%.2f, Lacu=%.2f",
@@ -293,9 +306,11 @@ local function Phase1_InitialCaveFormation()
 	else
 		print("Phase 1 INFO: Domain Warping is DISABLED.")
 	end
+
 	local startTime = os.clock()
 	local airCellsSetInP1 = 0
-	local exampleFinalDensityForSlice
+	local broadPassSetToSolidCount = 0 -- Counter for cells set by broad pass
+	local exampleFinalDensityForSlice -- Remains for detailed pass sampling
 
 	for z = 1, gridSizeZ do
 		for y = 1, gridSizeY do
@@ -304,78 +319,104 @@ local function Phase1_InitialCaveFormation()
 				local worldY_orig = origin.Y + (y - 0.5) * cellSize
 				local worldZ_orig = origin.Z + (z - 0.5) * cellSize
 
-				local worldX_input = worldX_orig
-				local worldY_input = worldY_orig
-				local worldZ_input = worldZ_orig
+				local skipDetailedCalculation = false
 
-				if CaveConfig.P1_UseDomainWarp then
-					local warpedX, warpedY, warpedZ = Perlin.DomainWarp(
-						worldX_orig, worldY_orig, worldZ_orig,
-						CaveConfig.P1_DomainWarp_FrequencyFactor,
-						CaveConfig.P1_DomainWarp_Strength,
-						nil, -- Use default Perlin.Noise_Raw from Perlin.lua's DomainWarp
-						CaveConfig.P1_DomainWarp_Octaves,
-						CaveConfig.P1_DomainWarp_Persistence,
-						CaveConfig.P1_DomainWarp_Lacunarity
-					)
-					worldX_input = warpedX
-					worldY_input = warpedY
-					worldZ_input = warpedZ
+				-- Hierarchical Noise Pass (Broad Structure)
+				if CaveConfig.P1_UseHierarchicalNoise then
+					local broadNoiseEffectiveScale = CaveConfig.P1_NoiseScale * CaveConfig.P1_BroadStructure_NoiseScaleFactor
 
-					-- Optional: Debug print for a few initial cells to see warp effect
-					if CaveConfig.DebugMode and x <= 1 and y <= 1 and z <= 1 then
-						local iterationNum = (z-1)*gridSizeX*gridSizeY + (y-1)*gridSizeX + x
-						if iterationNum <= 2 then -- Print for first couple of cells
-							print(string.format("P1 DW DEBUG: Cell(%d,%d,%d) Orig(%0.2f,%0.2f,%0.2f) -> Warped(%0.2f,%0.2f,%0.2f)",
-								x,y,z, worldX_orig, worldY_orig, worldZ_orig, warpedX, warpedY, warpedZ))
+					local broadNoiseVal = localFractalNoise(worldX_orig, worldY_orig, worldZ_orig,
+						broadNoiseEffectiveScale,
+						CaveConfig.P1_BroadStructure_Octaves,
+						CaveConfig.P1_Persistence, -- Using main persistence
+						CaveConfig.P1_Lacunarity)  -- Using main lacunarity
+
+					-- If broad noise suggests a solid area, mark as SOLID and skip detailed calculation
+					if broadNoiseVal > CaveConfig.P1_BroadStructure_Threshold then
+						grid:set(x, y, z, SOLID)
+						skipDetailedCalculation = true
+						broadPassSetToSolidCount = broadPassSetToSolidCount + 1
+
+						if CaveConfig.DebugMode and broadPassSetToSolidCount < 15 and broadPassSetToSolidCount % 1 == 0 then -- Log a few initial ones
+							print(string.format("P1 HIERARCHICAL: Cell(%d,%d,%d) SOLID by Broad Pass. Noise=%.4f (Thresh=%.3f)",
+								x,y,z, broadNoiseVal, CaveConfig.P1_BroadStructure_Threshold))
 						end
 					end
 				end
 
-				local noiseVal = localFractalNoise(worldX_input, worldY_input, worldZ_input,
-					CaveConfig.P1_NoiseScale,
-					CaveConfig.P1_Octaves,
-					CaveConfig.P1_Persistence,
-					CaveConfig.P1_Lacunarity)
+				-- Detailed Noise Pass (Domain Warped or Regular)
+				if not skipDetailedCalculation then
+					local worldX_input = worldX_orig
+					local worldY_input = worldY_orig
+					local worldZ_input = worldZ_orig
 
-				-- Biases still use original world coordinates.
-				-- You might experiment with using warped coordinates for biases too,
-				-- but for now, this will warp the base shape and biases apply on top.
-				local hBias = localHeightBias(y, gridSizeY) -- Based on grid cell y
-				local dBias = localDistanceToCenterBias(x, y, z, -- Based on grid cell x,y,z
-					gridSizeX, gridSizeY, gridSizeZ, CaveConfig.P1_DistanceBias_Max)
-				local vConnBias = localVerticalConnectivityNoise(worldX_orig, worldY_orig, worldZ_orig, -- Uses original world coords
-					CaveConfig.P1_NoiseScale)
+					if CaveConfig.P1_UseDomainWarp then
+						local warpedX, warpedY, warpedZ = Perlin.DomainWarp(
+							worldX_orig, worldY_orig, worldZ_orig,
+							CaveConfig.P1_DomainWarp_FrequencyFactor,
+							CaveConfig.P1_DomainWarp_Strength,
+							nil, -- Use default Perlin.Noise_Raw
+							CaveConfig.P1_DomainWarp_Octaves,
+							CaveConfig.P1_DomainWarp_Persistence,
+							CaveConfig.P1_DomainWarp_Lacunarity
+						)
+						worldX_input = warpedX
+						worldY_input = warpedY
+						worldZ_input = warpedZ
 
-				local finalDensity = noiseVal +
-					hBias +
-					dBias +
-					vConnBias
-
-				if x == math.floor(gridSizeX/2) and y == math.floor(gridSizeY/2) then
-					exampleFinalDensityForSlice = finalDensity
-				end
-
-				if finalDensity < CaveConfig.Threshold then
-					grid:set(x, y, z, AIR); airCellsSetInP1 = airCellsSetInP1 + 1
-					if airCellsSetInP1 < 15 and CaveConfig.DebugMode then
-						print(string.format("P1 DEBUG: Cell(%d,%d,%d) SET TO AIR. finalDensity=%.4f (Noise=%.3f), Thresh=%.4f",x,y,z,finalDensity,noiseVal,CaveConfig.Threshold))
+						if CaveConfig.DebugMode and x <= 1 and y <= 1 and z <= 1 then -- Existing DW debug
+							local iterationNum = (z-1)*gridSizeX*gridSizeY + (y-1)*gridSizeX + x
+							if iterationNum <= 2 then 
+								print(string.format("P1 DW DEBUG: Cell(%d,%d,%d) Orig(%0.2f,%0.2f,%0.2f) -> Warped(%0.2f,%0.2f,%0.2f)",
+									x,y,z, worldX_orig, worldY_orig, worldZ_orig, warpedX, warpedY, warpedZ))
+							end
+						end
 					end
-				else
-					grid:set(x, y, z, SOLID)
+
+					local noiseVal = localFractalNoise(worldX_input, worldY_input, worldZ_input,
+						CaveConfig.P1_NoiseScale,
+						CaveConfig.P1_Octaves,
+						CaveConfig.P1_Persistence,
+						CaveConfig.P1_Lacunarity)
+
+					local hBias = localHeightBias(y, gridSizeY)
+					local dBias = localDistanceToCenterBias(x, y, z, gridSizeX, gridSizeY, gridSizeZ, CaveConfig.P1_DistanceBias_Max)
+					local vConnBias = localVerticalConnectivityNoise(worldX_orig, worldY_orig, worldZ_orig, CaveConfig.P1_NoiseScale)
+
+					local finalDensity = noiseVal + hBias + dBias + vConnBias
+
+					if x == math.floor(gridSizeX/2) and y == math.floor(gridSizeY/2) then
+						exampleFinalDensityForSlice = finalDensity -- Keep for detailed pass sample
+					end
+
+					if finalDensity < CaveConfig.Threshold then
+						grid:set(x, y, z, AIR); airCellsSetInP1 = airCellsSetInP1 + 1
+						if airCellsSetInP1 < 15 and CaveConfig.DebugMode then
+							print(string.format("P1 DETAILED: Cell(%d,%d,%d) SET TO AIR. finalDensity=%.4f (Noise=%.3f), Thresh=%.4f",x,y,z,finalDensity,noiseVal,CaveConfig.Threshold))
+						end
+					else
+						grid:set(x, y, z, SOLID)
+					end
 				end
 				doYield()
 			end -- End for x
 		end -- End for y
+
+		-- Existing Z-slice debug print
 		if CaveConfig.DebugMode and z % 20 == 0 then
-			if exampleFinalDensityForSlice then
-				print(string.format("P1 DEBUG: Z-slice %d. Sample Density (mid): %.4f for Thresh %.4f",z,exampleFinalDensityForSlice,CaveConfig.Threshold))
-			else
-				print(string.format("P1 DEBUG: Z-slice %d done.", z))
+			local status_msg = string.format("P1 DEBUG: Z-slice %d done.", z)
+			if exampleFinalDensityForSlice then -- Will only be set if at least one cell in the slice went through detailed pass
+				status_msg = string.format("P1 DEBUG: Z-slice %d. Sample DetailedDensity(mid): %.4f (Thresh %.4f)", z, exampleFinalDensityForSlice, CaveConfig.Threshold)
 			end
+			if CaveConfig.P1_UseHierarchicalNoise then
+				status_msg = status_msg .. string.format(" BroadSolid: %d.", broadPassSetToSolidCount)
+			end
+			print(status_msg)
+			exampleFinalDensityForSlice = nil -- Reset for next sampled slice
 		end
 	end -- End for z
 
+	-- Solidify borders (existing logic)
 	for z_b = 1, gridSizeZ do
 		for x_b = 1, gridSizeX do
 			for y_b = 1, gridSizeY do
@@ -385,7 +426,12 @@ local function Phase1_InitialCaveFormation()
 		end
 	end
 	if CaveConfig.DebugMode then print("P1 DEBUG: Borders solidified.") end
-	print("P1 INFO: Total cells set to AIR in P1: " .. airCellsSetInP1)
+
+	-- Final P1 summary prints
+	print("P1 INFO: Total cells set to AIR in P1 (detailed pass): " .. airCellsSetInP1)
+	if CaveConfig.P1_UseHierarchicalNoise then
+		print("P1 INFO: Total cells set to SOLID by broad pass (skipped detailed): " .. broadPassSetToSolidCount)
+	end
 	local endTime = os.clock(); print("P1 INFO: Finished! Time: " .. string.format("%.2f", endTime - startTime) .. "s")
 end -- End Phase1_InitialCaveFormation
 
@@ -1427,28 +1473,20 @@ local function RunCaveGeneration()
 		warn("RunCaveGeneration WARN: Grid(1,1,1) not SOLID! Val: "..tostring(grid:get(1,1,1)))
 	else 
 		print("RunCaveGeneration INFO: Grid(1,1,1) SOLID.")
-	end -- End if/else grid(1,1,1) check
-
-	Phase1_InitialCaveFormation()
-	if CaveConfig.DebugMode then
-		local airP1, solidP1 = CountCellTypesInGrid(grid)
-		print(string.format("--- DEBUG POST-P1: AIR cells = %d, SOLID cells = %d ---", airP1, solidP1))
 	end
 
-	if CaveConfig.FormationPhaseEnabled then Phase2_RockFormations() end
-	if CaveConfig.DebugMode and CaveConfig.FormationPhaseEnabled then
-		local airP2, solidP2 = CountCellTypesInGrid(grid)
-		print(string.format("--- DEBUG POST-P2: AIR cells = %d, SOLID cells = %d ---", airP2, solidP2))
-	end
-
-	if CaveConfig.SmoothingPhaseEnabled then Phase3_Smoothing() end
-
+	-- mainCaveCellIndices initialization MOVED INSIDE and BEFORE phases that might use it extensively.
+	-- However, P5 always re-populates it based on the largest component found then.
+	-- P4 also re-populates it if connections are made.
+	-- P6 re-populates it if entrances are made and FloodFillPhaseEnabled.
+	-- So, simply declaring it should be fine:
 	mainCaveCellIndices={}
 	yieldCounter=0
 	local overallStartTime=os.clock()
 	local errorInPhase=false
+
 	local phasesToRun={
-		{name="Phase1_InitialCaveFormation",func=Phase1_InitialCaveFormation,enabled=true},
+		{name="Phase1_InitialCaveFormation",func=Phase1_InitialCaveFormation,enabled=true}, -- THIS IS THE ONLY P1 CALL NOW
 		{name="Phase2_RockFormations",func=Phase2_RockFormations,enabled=CaveConfig.FormationPhaseEnabled},
 		{name="Phase3_Smoothing",func=Phase3_Smoothing,enabled=CaveConfig.SmoothingPhaseEnabled},
 		{name="Phase4_EnsureConnectivity",func=Phase4_EnsureConnectivity,enabled=CaveConfig.ConnectivityPhaseEnabled},
@@ -1457,6 +1495,7 @@ local function RunCaveGeneration()
 		{name="Phase7_Bridges",func=Phase7_Bridges,enabled=CaveConfig.BridgePhaseEnabled},
 		{name="Phase8_BuildWorld",func=Phase8_BuildWorld,enabled=true}
 	}
+
 	for i,phaseInfo in ipairs(phasesToRun) do 
 		if phaseInfo.enabled then 
 			print("--- RunCaveGeneration: Starting "..phaseInfo.name.." ---")
@@ -1467,15 +1506,26 @@ local function RunCaveGeneration()
 					warn(debug.traceback(errMsg,2))
 				else 
 					warn(debug.traceback("Err in pcall,no str msg.",2))
-				end -- End if errMsg is string
+				end
 				errorInPhase=true; break 
 			else 
 				print("--- RunCaveGeneration: Finished "..phaseInfo.name.." ---")
-			end -- End if not success
+				-- Add debug cell counts after key phases IF DebugMode is on
+				if CaveConfig.DebugMode then
+					if phaseInfo.name == "Phase1_InitialCaveFormation" or 
+						phaseInfo.name == "Phase2_RockFormations" or
+						phaseInfo.name == "Phase3_Smoothing" or -- Can be useful after smoothing too
+						phaseInfo.name == "Phase5_FloodFillCleanup" or
+						phaseInfo.name == "Phase6_SurfaceEntrances" then
+						local airCount, solidCount = CountCellTypesInGrid(grid)
+						print(string.format("--- DEBUG POST-%s: AIR cells = %d, SOLID cells = %d ---", phaseInfo.name, airCount, solidCount))
+					end
+				end
+			end
 		else 
 			print("--- RunCaveGeneration: Skipping "..phaseInfo.name.." ---")
-		end -- End if phaseInfo.enabled
-	end -- End for phasesToRun
+		end
+	end
 
 	local overallEndTime=os.clock()
 	print("-----------------------------------------------------")
