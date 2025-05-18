@@ -91,6 +91,19 @@ Config.BridgeThickness_Cells_MinMax = {1, 2} -- Thinner bridges initially
 Config.BridgeWidth_Cells_MinMax = {1, 2}   
 
 --------------------------------------------------------------------------------
+-- III.B. PHASE 1 - DOMAIN WARPING PARAMETERS
+--------------------------------------------------------------------------------
+Config.P1_UseDomainWarp = true                -- Toggle to enable/disable domain warping for Phase 1
+Config.P1_DomainWarp_Strength = 20.0          -- Max displacement distance for warping (in world units).
+-- E.g., if CellSize=4, strength 20 means max ~5 cells displacement.
+Config.P1_DomainWarp_FrequencyFactor = 0.01   -- Frequency of the noise used for warping.
+-- Smaller values = larger, smoother warp features.
+-- Compare to P1_NoiseScale (e.g., 0.022). 0.01 would make warp features ~2x larger.
+Config.P1_DomainWarp_Octaves = 3              -- Number of octaves for the FBM warp noise. More octaves = more detailed warp.
+Config.P1_DomainWarp_Persistence = 0.5        -- Persistence for the FBM warp noise.
+Config.P1_DomainWarp_Lacunarity = 2.0         -- Lacunarity for the FBM warp noise.
+
+--------------------------------------------------------------------------------
 -- IV. ORE
 --------------------------------------------------------------------------------
 Config.OreVeins = { 
@@ -122,8 +135,8 @@ Config.FBM_DefaultOctaves = 6
 Config.FBM_DefaultPersistence = 0.5
 Config.FBM_DefaultLacunarity = 2.0
 -- You can add other defaults here for DomainWarp, GuidedFBM etc. from Perlin.lua if you start using them without passing all params.
-Config.P1_DomainWarp_Strength = 25       -- Example if you add domain warp to Phase 1
-Config.P1_DomainWarp_FrequencyFactor = 0.4 -- Example
+-- Config.P1_DomainWarp_Strength = 25       -- Example if you add domain warp to Phase 1
+-- Config.P1_DomainWarp_FrequencyFactor = 0.4 -- Example
 
 -- Debug Settings
 Config.FloodFillContext_MaxInitialDebugAttempts = 3 -- How many flood fill *attempts* get detailed logs from _floodFillSearch
