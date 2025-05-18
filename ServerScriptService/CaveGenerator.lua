@@ -511,130 +511,218 @@ local function Phase3_Smoothing()
 	print("P3 INFO: Finished! Time: "..string.format("%.2f",eTime-sTime).."s")
 end -- End Phase3_Smoothing
 
-local function _floodFillSearch_local_p45(startX,startY,startZ,visitedGrid) 
-	local compCells={};local q=Queue.new()
+-- Script-level state for _floodFillSearch to avoid UnknownGlobal if not passed.
+-- These are effectively parameters to the function if declared in its signature.
 
-	-- More detailed checks at the start of the flood fill
+local function _floodFillSearch_local_p45(startX, startY, startZ, visitedGrid, invocationContext) 
+	local compCells = {}
+	local q = Queue.new()
+
+	-- Validate inputs and initial state
 	local isInBoundsFlag = grid:isInBounds(startX,startY,startZ)
 	local initialCellVal = nil
-	if isInBoundsFlag then initialCellVal = grid:get(startX,startY,startZ) end
-	local isVisitedFlag = visitedGrid:get(startX,startY,startZ) -- This is specifically on the 'visitedGrid' passed in
-
-	if CaveConfig.DebugMode then
-		print(string.format("_floodFillSearch INVOKED with: start (%d,%d,%d)", startX,startY,startZ))
-		print(string.format("    InBoundsCheck: %s", tostring(isInBoundsFlag)))
-		if isInBoundsFlag then print(string.format("    InitialCellValueCheck: %s (expected AIR i.e. 0)", tostring(initialCellVal))) end
-		print(string.format("    VisitedCheck: %s (expected false)", tostring(isVisitedFlag)))
+	if isInBoundsFlag then 
+		initialCellVal = grid:get(startX,startY,startZ) 
 	end
 
-	if (not isInBoundsFlag) or (initialCellVal ~= AIR) or (isVisitedFlag == true) then 
-		-- One of these conditions must be met to "Not Start"
-		if CaveConfig.DebugMode then
-			print(string.format("_floodFillSearch DEBUG: Condition MET - Not starting. InBounds:%s, IsAir:%s, IsVisited:%s", 
-				tostring(isInBoundsFlag), 
-				tostring(initialCellVal == AIR), -- Correctly check if it IS AIR
-				tostring(isVisitedFlag)))
+	local isVisitedFlag = false 
+	if not visitedGrid or not visitedGrid.data then
+		if CaveConfig.DebugMode then 
+			warn(string.format("_floodFillSearch_local_p45 FATAL: 'visitedGrid' parameter is nil or invalid for start (%d,%d,%d). Cannot proceed.", startX, startY, startZ))
+		end
+		return compCells 
+	end
+	if visitedGrid:isInBounds(startX, startY, startZ) then
+		isVisitedFlag = visitedGrid:get(startX,startY,startZ)
+	elseif CaveConfig.DebugMode then 
+		-- warn(string.format("_floodFillSearch_local_p45: Start coords (%d,%d,%d) out of bounds for 'visitedGrid'. Assuming not visited.", startX, startY, startZ))
+	end
+
+	-- CONDITIONAL initial prints (only for first few attempts in a _findAirComponents_local_p45 call)
+	if CaveConfig.DebugMode and invocationContext and invocationContext.floodFillAttempts <= (CaveConfig.FloodFillContext_MaxInitialDebugAttempts or 3) then
+		print(string.format("_floodFillSearch INVOKED #%d with: start (%d,%d,%d)", invocationContext.floodFillAttempts, startX,startY,startZ))
+		print(string.format("    Grid InBounds: %s, InitialCellVal: %s, isVisitedInVisitedGrid: %s", 
+			tostring(isInBoundsFlag), tostring(initialCellVal), tostring(isVisitedFlag)))
+	end
+
+	-- Check conditions to start flood fill
+	if not isInBoundsFlag or initialCellVal ~= AIR or isVisitedFlag == true then 
+		if CaveConfig.DebugMode and invocationContext and invocationContext.floodFillAttempts <= (CaveConfig.FloodFillContext_MaxInitialDebugAttempts or 3) then
+			print(string.format("_floodFillSearch DEBUG #%d: Flood PREVENTED. InBounds:%s, IsAir:%s, IsVisited:%s", 
+				invocationContext.floodFillAttempts, tostring(isInBoundsFlag), tostring(initialCellVal == AIR), tostring(isVisitedFlag)))
 		end
 		return compCells 
 	end
 
-	-- If we reach here, the above 'if' was FALSE, so flood fill SHOULD proceed
-	if CaveConfig.DebugMode then print(string.format("_floodFillSearch DEBUG: PASSED initial checks. Starting flood from (%d,%d,%d)", startX,startY,startZ)) end
+	if CaveConfig.DebugMode and invocationContext and invocationContext.floodFillAttempts <= (CaveConfig.FloodFillContext_MaxInitialDebugAttempts or 3) then
+		print(string.format("_floodFillSearch DEBUG #%d: PASSED initial checks. Starting flood from (%d,%d,%d)", invocationContext.floodFillAttempts, startX,startY,startZ))
+	end
 
 	q:push({x=startX,y=startY,z=startZ})
-	visitedGrid:set(startX,startY,startZ,true) -- Mark the STARTING cell as visited for THIS flood instance
+	visitedGrid:set(startX,startY,startZ,true)
 
 	local cellsProcessedInFlood = 0
 	while not q:isEmpty() do 
-		local cell=q:pop()
-		if cell then 
-			table.insert(compCells,cell)
-			cellsProcessedInFlood = cellsProcessedInFlood + 1 
+		local cell = q:pop()
+		if not cell then 
+			if CaveConfig.DebugMode then warn("_floodFillSearch: q:pop() returned nil unexpectedly! Breaking loop.") end
+			break 
 		end
-		doYield()
-		local DIRS={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
-		if cell then 
-			for _,dir in ipairs(DIRS) do 
-				local nx,ny,nz=cell.x+dir[1],cell.y+dir[2],cell.z+dir[3]
-				if grid:isInBounds(nx,ny,nz) and grid:get(nx,ny,nz)==AIR and not visitedGrid:get(nx,ny,nz) then 
-					visitedGrid:set(nx,ny,nz,true)
-					q:push({x=nx,y=ny,z=nz})
-				end
+
+		table.insert(compCells, cell)
+		cellsProcessedInFlood = cellsProcessedInFlood + 1 
+
+		doYield() 
+
+		local DIRS = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
+		for _,dir in ipairs(DIRS) do 
+			local nx,ny,nz = cell.x+dir[1], cell.y+dir[2], cell.z+dir[3]
+
+			local neighborIsAlreadyVisited = true 
+			if visitedGrid:isInBounds(nx,ny,nz) then 
+				neighborIsAlreadyVisited = visitedGrid:get(nx,ny,nz)
+			end
+
+			if grid:isInBounds(nx,ny,nz) and grid:get(nx,ny,nz) == AIR and not neighborIsAlreadyVisited then 
+				visitedGrid:set(nx,ny,nz,true)
+				q:push({x=nx,y=ny,z=nz})
 			end
 		end
-	end -- End while
+	end 
 
-	if CaveConfig.DebugMode then 
-		print(string.format("_floodFillSearch DEBUG: Flood from (%d,%d,%d) finished. Component size: %d. Cells processed in this flood: %d", 
-			startX,startY,startZ, #compCells, cellsProcessedInFlood)) 
+	-- CONDITIONAL "finished" print
+	if CaveConfig.DebugMode then
+		local compSize = #compCells
+		local shouldPrintFinish = false
+		if compSize > 0 then
+			if invocationContext and invocationContext.componentsFound < (CaveConfig.FloodFillContext_MaxInitialComponentLogs or 3) then
+				shouldPrintFinish = true -- Log first few components found
+			elseif compSize > (CaveConfig.FloodFillContext_LargeComponentThreshold or 1000) then
+				shouldPrintFinish = true -- Log very large components
+			elseif compSize < (CaveConfig.FloodFillContext_SmallComponentThreshold or 10) and compSize > 0 then -- Avoid printing for 0-size that didn't flood
+				shouldPrintFinish = true -- Log very small (but non-zero) components
+			end
+		end
+
+		if shouldPrintFinish then
+			print(string.format("_floodFillSearch DEBUG #%d (Comp #%d): Flood from (%d,%d,%d) finished. Size: %d cells. ProcessedInFlood: %d", 
+				invocationContext and invocationContext.floodFillAttempts or 0,
+				invocationContext and invocationContext.componentsFound + 1 or 0, -- +1 because component is about to be "found"
+				startX,startY,startZ, compSize, cellsProcessedInFlood))
+		end
 	end
 	return compCells
-end -- End _floodFillSearch_local_p45 (DETAILED DEBUG)
+end
 
 local function _findAirComponents_local_p45() 
-	local components={};
+	local components={}
 	local visited=Grid3D.new(gridSizeX,gridSizeY,gridSizeZ,false) 
 
-	print("_findAirComponents_local_p45 DEBUG: Starting search...")
+	if not visited or not visited.data then
+		error("FAC_p45 CRITICAL: Failed to create 'visited' Grid3D instance. Halting component search.")
+		return components 
+	end
+
+	if CaveConfig.DebugMode then print("_findAirComponents_local_p45: Starting component search...") end
 	local airCellsFoundByIteration = 0
 	local solidCellsFoundByIteration = 0
 	local nilCellsFoundByIteration = 0
-	local firstAirCellCoords = nil
+	local firstAirCellCoords = nil -- For debug
+
+	-- Context for _floodFillSearch_local_p45 debugging & local stats
+	local floodFillContext_p45 = {
+		floodFillAttempts = 0, -- How many times we try to start a flood
+		componentsFound = 0    -- How many actual components were identified
+	}
+	local minComponentSize_p45 = gridSizeX * gridSizeY * gridSizeZ + 1 -- Init to impossibly large
+	local maxComponentSize_p45 = 0
+	local totalCellsInFoundComponents_p45 = 0
 
 	for z_l=1,gridSizeZ do 
 		for y_l=1,gridSizeY do 
 			for x_l=1,gridSizeX do 
-				-- DIRECTLY CHECK THE GRID VALUE HERE
 				local currentCellValue = grid:get(x_l,y_l,z_l)
 
 				if currentCellValue == AIR then
 					airCellsFoundByIteration = airCellsFoundByIteration + 1
-					if not firstAirCellCoords then -- Store coordinates of the VERY FIRST air cell found by this loop
+					if not firstAirCellCoords and CaveConfig.DebugMode and (CaveConfig.FloodFillLogFirstAirCellFound == nil or CaveConfig.FloodFillLogFirstAirCellFound) then
 						firstAirCellCoords = {x=x_l, y=y_l, z=z_l}
-						if CaveConfig.DebugMode then
-							print(string.format("FAC_p45 DEBUG: FIRST AIR CELL found by iteration at (%d,%d,%d)", x_l,y_l,z_l))
-						end
+						print(string.format("FAC_p45 DEBUG: FIRST AIR CELL found by iteration at (%d,%d,%d)", x_l,y_l,z_l))
 					end
 
-					-- Now, only if it's air AND not visited, try to flood fill
-					if not visited:get(x_l,y_l,z_l) then 
-						local nComp=_floodFillSearch_local_p45(x_l,y_l,z_l,visited) -- _floodFillSearch_local_p45 also uses grid:get
+					local isAlreadyVisited = false
+					if visited:isInBounds(x_l,y_l,z_l) then
+						isAlreadyVisited = visited:get(x_l,y_l,z_l)
+					end
+
+					if not isAlreadyVisited then 
+						floodFillContext_p45.floodFillAttempts = floodFillContext_p45.floodFillAttempts + 1
+						local nComp = _floodFillSearch_local_p45(x_l,y_l,z_l,visited, floodFillContext_p45) 
+
 						if #nComp>0 then 
+							floodFillContext_p45.componentsFound = floodFillContext_p45.componentsFound + 1
+							local currentCompSize = #nComp
+							totalCellsInFoundComponents_p45 = totalCellsInFoundComponents_p45 + currentCompSize
+							if currentCompSize < minComponentSize_p45 then minComponentSize_p45 = currentCompSize end
+							if currentCompSize > maxComponentSize_p45 then maxComponentSize_p45 = currentCompSize end
 							table.insert(components,nComp)
-							if CaveConfig.DebugMode and #components < 5 then 
-								print(string.format("FAC_p45 DEBUG: Actual Component %d (size %d) started from (%d,%d,%d)",#components,#nComp,x_l,y_l,z_l))
-							end 
+							-- Individual component log is now handled conditionally inside _floodFillSearch_local_p45
 						end
-					end -- End if not visited
+					end 
 				elseif currentCellValue == SOLID then
 					solidCellsFoundByIteration = solidCellsFoundByIteration + 1
-				else
+				else 
 					nilCellsFoundByIteration = nilCellsFoundByIteration + 1
-					if CaveConfig.DebugMode and nilCellsFoundByIteration < 5 then
-						print(string.format("FAC_p45 DEBUG: Found NIL cell at (%d,%d,%d) during iteration!", x_l, y_l, z_l))
+					if CaveConfig.DebugMode and nilCellsFoundByIteration < (CaveConfig.FloodFillMaxNilCellLogs or 3) then
+						print(string.format("FAC_p45 DEBUG: Found NIL/unexpected cell value '%s' at (%d,%d,%d) during iteration!",tostring(currentCellValue), x_l, y_l, z_l))
 					end
-				end -- End if currentCellValue check
-			end -- End for x_l
-		end -- End for y_l
-		if CaveConfig.DebugMode and z_l % 20 == 0 then
-			print(string.format("FAC_p45 DEBUG: Iterated up to z_l = %d. Current airCellsFoundByIteration = %d", z_l, airCellsFoundByIteration))
+				end
+				doYield() 
+			end 
+		end 
+		if CaveConfig.DebugMode and z_l % math.max(1, math.floor(gridSizeZ / (CaveConfig.FloodFillZSliceLogDivisor or 10))) == 0 then
+			print(string.format("FAC_p45 PROGRESS: Z-slice %d/%d. Air cells by iter: %d. Attempts: %d, Comps Found: %d",
+				z_l, gridSizeZ, airCellsFoundByIteration, floodFillContext_p45.floodFillAttempts, floodFillContext_p45.componentsFound))
 		end
-	end -- End for z_l
+	end 
 
 	table.sort(components,function(a,b)return #a>#b end) 
 
-	print(string.format("FAC_p45 DEBUG: Iteration finished. Total AIR cells encountered by loop: %d", airCellsFoundByIteration))
-	print(string.format("FAC_p45 DEBUG: Iteration finished. Total SOLID cells encountered by loop: %d", solidCellsFoundByIteration))
-	print(string.format("FAC_p45 DEBUG: Iteration finished. Total NIL cells encountered by loop: %d", nilCellsFoundByIteration))
-	if firstAirCellCoords then
-		print(string.format("FAC_p45 DEBUG: Coordinates of FIRST air cell found by iteration: (%d,%d,%d)", firstAirCellCoords.x, firstAirCellCoords.y, firstAirCellCoords.z))
+	-- Enhanced summary print, always shows if DebugMode is true
+	if CaveConfig.DebugMode then
+		print("--- FAC_p45 (_findAirComponents) SUMMARY ---")
+		print(string.format("  Grid Iteration encountered: AIR: %d, SOLID: %d, NIL/Other: %d",
+			airCellsFoundByIteration, solidCellsFoundByIteration, nilCellsFoundByIteration))
+		if firstAirCellCoords and (CaveConfig.FloodFillLogFirstAirCellFound == nil or CaveConfig.FloodFillLogFirstAirCellFound) then
+			print(string.format("  First air cell by iteration: (%d,%d,%d)", firstAirCellCoords.x, firstAirCellCoords.y, firstAirCellCoords.z))
+		end
+		print(string.format("  Flood Fill Attempts: %d", floodFillContext_p45.floodFillAttempts))
+		print(string.format("  Total Air Components Identified: %d", #components))
+		if #components > 0 then
+			print(string.format("  Largest Component Size: %d cells", #components[1]))
+			local smallestInList = #components[#components] 
+			local recordedMin = minComponentSize_p45
+			if recordedMin == (gridSizeX * gridSizeY * gridSizeZ + 1) then 
+				recordedMin = (#components > 0 and smallestInList or 0)
+			end
+			print(string.format("  Smallest Component in List: %d cells. (Smallest recorded during scan: %d)", smallestInList, recordedMin))
+			print(string.format("  Max Component Size Recorded: %d cells", maxComponentSize_p45))
+			print(string.format("  Total Cells in all Found Components: %d", totalCellsInFoundComponents_p45))
+			if #components > 0 then
+				print(string.format("  Average Component Size: %.2f cells", totalCellsInFoundComponents_p45 / #components))
+			end
+		else
+			print("  No actual air components were formed by flood fill.")
+		end
+		print("--------------------------------------------")
 	else
-		print("FAC_p45 DEBUG: NO air cells were found by the iteration loop directly from 'grid:get'.")
+		-- Non-debug mode still gets a very concise summary (useful for P4/P5)
+		print(string.format("FAC_p45 INFO: Found %d air components. Largest: %d cells.",
+			#components, (#components > 0 and #components[1] or 0) ))
 	end
-	print(string.format("FAC_p45 DEBUG: Found %d components total.", #components))
 
 	return components
-end -- End _findAirComponents_local_p45 (EXTREME DEBUG)
+end
 
 local function _carveTunnel_local_p46(p1,p2,radiusFactor) 
 	local rad=math.max(1,math.floor(CaveConfig.ConnectivityTunnelRadius_Factor*radiusFactor))
@@ -702,10 +790,10 @@ local function Phase4_EnsureConnectivity()
 				if c1s and c2s then 
 					local dSq=(c1s.x-c2s.x)^2+(c1s.y-c2s.y)^2+(c1s.z-c2s.z)^2
 					if dSq<cDistSq then cDistSq=dSq;cA_b,cB_b=c1s,c2s end 
-				end -- End if c1s and c2s
-			end -- End for c2s
+				end 
+			end 
 			doYield()
-		end -- End for c1s
+		end 
 
 		if cA_b and cB_b then 
 			_carveTunnel_local_p46(cA_b,cB_b,1.0)
@@ -713,15 +801,40 @@ local function Phase4_EnsureConnectivity()
 			connsMade=connsMade+1
 			if compB and mainC then 
 				for _,bC_m in ipairs(compB) do if bC_m then table.insert(mainC,bC_m)end end 
-			end -- End if compB and mainC (merge)
+			end 
 		else 
 			print("P4 WARN: Failed to connect comp idx",tCompIdx)
-		end -- End if cA_b and cB_b (carve)
-	end -- End for tCompIdx
-	if connsMade>0 then mainCaveCellIndices={} end 
+		end 
+	end 
+	if connsMade>0 then mainCaveCellIndices={} end -- If connections made, re-evaluate mainCaveCellIndices.
+	-- More robustly, after connections, the largest component might have changed, or existing mainC absorbed others.
+	-- So, it might be better to call _findAirComponents again if P5 relies on the *absolute* largest.
+	-- For now, if P5 calls _findAirComponents_local_p45 again, this reset might be okay.
+	-- To be safe and ensure mainCaveCellIndices accurately reflects the current largest connected component post-P4:
+	if connsMade > 0 then
+		print("P4 INFO: Connections made. Re-identifying the main cave component.")
+		local finalAirCs_P4 = _findAirComponents_local_p45() -- This will run with the (now less spammy) flood fill debug
+		if #finalAirCs_P4 > 0 and finalAirCs_P4[1] then
+			mainCaveCellIndices = {}
+			for _, cellData in ipairs(finalAirCs_P4[1]) do
+				if cellData then
+					local idx = grid:index(cellData.x, cellData.y, cellData.z)
+					if idx then mainCaveCellIndices[idx] = true end
+				end
+			end
+			if CaveConfig.DebugMode then
+				local count = 0; for _ in pairs(mainCaveCellIndices) do count = count + 1 end
+				print("P4 DEBUG: mainCaveCellIndices repopulated. New main component size: " .. count)
+			end
+		else
+			if CaveConfig.DebugMode then print("P4 DEBUG: No air components found after connections for mainCaveCellIndices repopulation.") end
+			mainCaveCellIndices = {} -- Ensure it's empty if no components
+		end
+	end
+
 	local eTime=os.clock()
 	print("P4 INFO: Finished! Time: "..string.format("%.2f",eTime-sTime).."s. Connections: "..connsMade)
-end -- End Phase4_EnsureConnectivity
+end
 
 local function Phase5_FloodFillCleanup()
 	print("P5 INFO: Starting flood fill cleanup...")
@@ -736,9 +849,9 @@ local function Phase5_FloodFillCleanup()
 			if cD_p5 then 
 				local idx_p5=grid:index(cD_p5.x,cD_p5.y,cD_p5.z)
 				if idx_p5 then mainCaveCellIndices[idx_p5]=true end 
-			end -- End if cD_p5 valid
-		end -- End for cD_p5
-	end -- End if airCs_p5[1] exists
+			end 
+		end 
+	end 
 
 	if CaveConfig.DebugMode then local mcC_p5=0;for _ in pairs(mainCaveCellIndices)do mcC_p5=mcC_p5+1 end;print("P5 DEBUG: mainCaveCellIndices populated w/ "..mcC_p5.." cells.")end
 
@@ -747,13 +860,13 @@ local function Phase5_FloodFillCleanup()
 		if airCs_p5[i_p5f] then 
 			for _,cDF_p5 in ipairs(airCs_p5[i_p5f]) do 
 				if cDF_p5 then grid:set(cDF_p5.x,cDF_p5.y,cDF_p5.z,SOLID);cellsF_p5=cellsF_p5+1;doYield()end 
-			end -- End for cDF_p5
-		end -- End if airCs_p5[i_p5f] exists
-	end -- End for i_p5f
+			end 
+		end 
+	end 
 	print(string.format("P5 INFO: Kept largest. Filled %d from %d smaller.",cellsF_p5,math.max(0,#airCs_p5-1)))
 	local eTime=os.clock()
 	print("P5 INFO: Finished! Time: "..string.format("%.2f",eTime-sTime).."s")
-end -- End Phase5_FloodFillCleanup
+end
 
 local function Phase6_SurfaceEntrances()
 	print("P6 INFO: Starting surface entrances...")
@@ -786,12 +899,12 @@ local function Phase6_SurfaceEntrances()
 								if CaveConfig.FloodFillPhaseEnabled then 
 									local ci_p6e=grid:index(ncx_p6e,ncy_p6e,ncz_p6e)
 									if ci_p6e then mainCaveCellIndices[ci_p6e]=true end 
-								end -- End if FloodFillEnabled
-							end -- End if isInBounds
-						end -- End if in sphere
-					end -- End for drz_p6e
-				end -- End for dry_p6e
-			end -- End for drx_p6e
+								end 
+							end 
+						end 
+					end 
+				end 
+			end 
 			doYield()
 
 			local cTunIdx_p6e=grid:index(cPos_p6e.x,cPos_p6e.y,cPos_p6e.z)
@@ -804,19 +917,19 @@ local function Phase6_SurfaceEntrances()
 							local chkIdx_p6e=grid:index(chkX_p6e,chkY_p6e,chkZ_p6e)
 							if chkIdx_p6e and mainCaveCellIndices[chkIdx_p6e] and grid:get(chkX_p6e,chkY_p6e,chkZ_p6e)==AIR then 
 								conn_p6e=true; break 
-							end -- End if connected
-						end -- End for oz_p6e
+							end 
+						end 
 						if conn_p6e then break end 
-					end -- End for oy_p6e
+					end 
 					if conn_p6e then break end 
-				end -- End for ox_p6e
-			end -- End if current tunnel pos is main cave
+				end 
+			end 
 			if conn_p6e then if CaveConfig.DebugMode then print("P6 DEBUG: Entrance",i_p6e,"connected.")end;break end 
-		end -- End while tunnel
+		end 
 		if conn_p6e then entrMade_p6=entrMade_p6+1 
 		elseif CaveConfig.DebugMode then print("P6 DEBUG: Entrance",i_p6e,"did not connect or reached max length/depth.")
-		end -- End if conn_p6e for counting
-	end -- End for i_p6e (each entrance)
+		end 
+	end 
 
 	print("P6 INFO: Created/attempted",entrMade_p6,"entrances of",CaveConfig.SurfaceCaveCount)
 	if entrMade_p6>0 and CaveConfig.FloodFillPhaseEnabled then 
@@ -828,18 +941,18 @@ local function Phase6_SurfaceEntrances()
 				if cD_p6r then 
 					local idx_p6r=grid:index(cD_p6r.x,cD_p6r.y,cD_p6r.z)
 					if idx_p6r then mainCaveCellIndices[idx_p6r]=true end 
-				end -- End if cD_p6r valid
-			end -- End for cD_p6r
+				end 
+			end 
 			if CaveConfig.DebugMode then 
 				local mcC_p6r=0; for _ in pairs(mainCaveCellIndices) do mcC_p6r=mcC_p6r+1 end
 				print("P6 DEBUG: Main cave re-identified:",mcC_p6r,"(Largest comp:",#airCs_p6r[1],")")
-			end -- End if DebugMode print
+			end 
 		elseif CaveConfig.DebugMode then print("P6 DEBUG: No air comps for re-eval post-entrances.")
-		end -- End if/elseif airCs_p6r
-	end -- End if entrances made and flood fill enabled
+		end 
+	end 
 	local eTime=os.clock()
 	print("P6 INFO: Finished! Time: "..string.format("%.2f",eTime-sTime).."s")
-end -- End Phase6_SurfaceEntrances
+end
 
 local function _checkBridgeChamberCriteria_local(cx,cy,cz,length) 
 	local minAirAbv=0
@@ -849,7 +962,7 @@ local function _checkBridgeChamberCriteria_local(cx,cy,cz,length)
 		local cIdx_bcc=grid:index(cx,tY,cz) 
 		if not(grid:get(cx,tY,cz)==AIR and(not CaveConfig.FloodFillPhaseEnabled or(cIdx_bcc and mainCaveCellIndices[cIdx_bcc]))) then return false end
 		minAirAbv=minAirAbv+1 
-	end -- End for h
+	end 
 	if minAirAbv<CaveConfig.BridgeChamberMinHeight_Cells then return false end
 
 	local airCC=0
@@ -859,7 +972,7 @@ local function _checkBridgeChamberCriteria_local(cx,cy,cz,length)
 
 	if targetX_valid and grid:get(cx+length,cy,cz)==AIR and grid:get(cx+length,cy-1,cz)==SOLID then mX=cx+length/2 
 	elseif targetZ_valid and grid:get(cx,cy,cz+length)==AIR and grid:get(cx,cy-1,cz+length)==SOLID then mZ=cz+length/2 
-	end -- End if/elseif target check
+	end 
 
 	local cRW=math.max(3,math.ceil(CaveConfig.BridgeChamberMinAirCells^(1/3)/2.0))
 	local cRC=math.ceil(cRW)
@@ -869,11 +982,11 @@ local function _checkBridgeChamberCriteria_local(cx,cy,cz,length)
 				local curX,curY,curZ=math.floor(mX+dx_bcc_l),cy+dy_bcc_l,math.floor(mZ+dz_bcc_l)
 				local ccci_bcc=grid:index(curX,curY,curZ)  
 				if ccci_bcc and grid:get(curX,curY,curZ)==AIR and(not CaveConfig.FloodFillPhaseEnabled or mainCaveCellIndices[ccci_bcc]) then airCC=airCC+1 end
-			end -- End for dz_bcc_l
-		end -- End for dy_bcc_l
-	end -- End for dx_bcc_l
+			end 
+		end 
+	end 
 	return airCC>=CaveConfig.BridgeChamberMinAirCells
-end -- End _checkBridgeChamberCriteria_local
+end 
 
 local function _buildBridge_local(p1,p2) 
 	local thk=localRandomInt(CaveConfig.BridgeThickness_Cells_MinMax[1],CaveConfig.BridgeThickness_Cells_MinMax[2])
@@ -891,27 +1004,27 @@ local function _buildBridge_local(p1,p2)
 				if grid:isInBounds(cX,brY,cZ) then 
 					if grid:get(cX,brY,cZ)==AIR then cellsSet=cellsSet+1 end
 					grid:set(cX,brY,cZ,SOLID) 
-				end -- End if isInBounds
-			end -- End for widOff
-		end -- End for mainAV
+				end 
+			end 
+		end 
 		doYield()
-	end -- End for brY
+	end 
 	if CaveConfig.DebugMode then print("_buildBridge_local DEBUG: Bridge done. Approx cells SOLID:",cellsSet)end
-end -- End _buildBridge_local
+end 
 
-local function Phase7_Bridges() -- This is the function starting around line 571 (in previous full version errors)
+local function Phase7_Bridges() 
 	print("P7 INFO: Starting bridges...")
 	local sTime_p7 = os.clock()
 	local brBuilt_p7 = 0
 	local bridgeCandidates_p7_list = {}
-	local x_p7_iter, y_p7_iter, z_p7_iter -- Current iteration point
+	local x_p7_iter, y_p7_iter, z_p7_iter 
 
 	for y_loop_main_p7 = gridSizeY - CaveConfig.BridgeChamberMinHeight_Cells - 2, CaveConfig.FormationStartHeight_Cells + CaveConfig.BridgeChamberMinHeight_Cells + 1, -1 do
 		y_p7_iter = y_loop_main_p7
 		for x_loop_main_p7 = 2, gridSizeX - 2 do
-			x_p7_iter = x_loop_main_p7 -- Initialize for the start of Z loop
+			x_p7_iter = x_loop_main_p7 
 			for z_loop_main_p7 = 2, gridSizeZ - 2 do
-				z_p7_iter = z_loop_main_p7 -- Initialize for this specific (x,z) attempt
+				z_p7_iter = z_loop_main_p7 
 				doYield()
 
 				local cellIdx_p7_start = grid:index(x_p7_iter, y_p7_iter, z_p7_iter)
@@ -920,9 +1033,8 @@ local function Phase7_Bridges() -- This is the function starting around line 571
 					(grid:get(x_p7_iter, y_p7_iter - 1, z_p7_iter) == SOLID)
 
 				if isValidStart_p7_check then
-					local current_x_for_scan = x_p7_iter -- Use this for X-scan, so original x_p7_iter for Z-scan is preserved
+					local current_x_for_scan = x_p7_iter 
 
-					-- Try X-direction bridges
 					for lenX_p7_scan = 2, 10 do
 						local lookX_p7_target = current_x_for_scan + lenX_p7_scan
 						if not grid:isInBounds(lookX_p7_target, y_p7_iter, z_p7_iter) then break end
@@ -939,17 +1051,16 @@ local function Phase7_Bridges() -- This is the function starting around line 571
 								if not (gXidx_p7_scan and grid:get(gx_p7_scan,y_p7_iter,z_p7_iter)==AIR and(not CaveConfig.FloodFillPhaseEnabled or mainCaveCellIndices[gXidx_p7_scan])) or
 									not (gXflrIdx_p7_scan and grid:get(gx_p7_scan,y_p7_iter-1,z_p7_iter)==AIR and(not CaveConfig.FloodFillPhaseEnabled or mainCaveCellIndices[gXflrIdx_p7_scan])) then
 									clearX_gap = false; break
-								end -- End if gap not clear for X
-							end -- End for gx_p7_scan
+								end 
+							end 
 							if clearX_gap and _checkBridgeChamberCriteria_local(current_x_for_scan, y_p7_iter, z_p7_iter, lenX_p7_scan) then
 								table.insert(bridgeCandidates_p7_list, { p1 = { x = current_x_for_scan, y = y_p7_iter, z = z_p7_iter }, p2 = { x = lookX_p7_target, y = y_p7_iter, z = z_p7_iter } })
-								x_loop_main_p7 = lookX_p7_target -- CRITICAL: Advance the OUTER x loop iterator to skip
-								break -- Found X-bridge, break from lenX_p7_scan loop, will also skip rest of z_loop for THIS OLD x_loop_main_p7
-							end -- End if clearX_gap and criteria
+								x_loop_main_p7 = lookX_p7_target 
+								break 
+							end 
 						elseif grid:get(lookX_p7_target,y_p7_iter,z_p7_iter)==SOLID or grid:get(lookX_p7_target,y_p7_iter-1,z_p7_iter)==AIR then break end
-					end -- End for lenX_p7_scan
+					end 
 
-					-- Try Z-direction bridges (uses original x_p7_iter from outer loop)
 					local current_z_for_scan = z_p7_iter
 					for lenZ_p7_scan = 2, 10 do
 						local lookZ_p7_target = current_z_for_scan + lenZ_p7_scan
@@ -966,27 +1077,27 @@ local function Phase7_Bridges() -- This is the function starting around line 571
 								if not (gZidx_p7_scan and grid:get(x_p7_iter,y_p7_iter,gz_p7_scan)==AIR and(not CaveConfig.FloodFillPhaseEnabled or mainCaveCellIndices[gZidx_p7_scan])) or
 									not (gZflrIdx_p7_scan and grid:get(x_p7_iter,y_p7_iter-1,gz_p7_scan)==AIR and(not CaveConfig.FloodFillPhaseEnabled or mainCaveCellIndices[gZflrIdx_p7_scan])) then
 									clearZ_gap = false; break
-								end -- End if gap not clear for Z
-							end -- End for gz_p7_scan
+								end 
+							end 
 							if clearZ_gap and _checkBridgeChamberCriteria_local(x_p7_iter, y_p7_iter, current_z_for_scan, lenZ_p7_scan) then
 								table.insert(bridgeCandidates_p7_list, { p1 = { x = x_p7_iter, y = y_p7_iter, z = current_z_for_scan }, p2 = { x = x_p7_iter, y = y_p7_iter, z = lookZ_p7_target } })
-								z_loop_main_p7 = lookZ_p7_target -- CRITICAL: Advance the OUTER z loop iterator
-								break -- Found Z-bridge
-							end -- End if clearZ_p7 and criteria
+								z_loop_main_p7 = lookZ_p7_target 
+								break 
+							end 
 						elseif grid:get(x_p7_iter,y_p7_iter,lookZ_p7_target)==SOLID or grid:get(x_p7_iter,y_p7_iter-1,lookZ_p7_target)==AIR then break end
-					end -- End for lenZ_p7_scan
-				end -- End if isValidStart_p7_check
-			end -- End for z_loop_main_p7 
-		end -- End for x_loop_main_p7
-	end -- End for y_loop_main_p7
+					end 
+				end 
+			end 
+		end 
+	end 
 
-	localShuffleTable(bridgeCandidates_p7_list) -- Correct variable name
+	localShuffleTable(bridgeCandidates_p7_list) 
 	local builtCoords_p7_val = {}
-	local toBuildCount_p7_val = math.min(#bridgeCandidates_p7_list, 30 + math.floor(gridSizeX * gridSizeZ / 5000)) -- Correct
+	local toBuildCount_p7_val = math.min(#bridgeCandidates_p7_list, 30 + math.floor(gridSizeX * gridSizeZ / 5000)) 
 	local actualBridgesBuiltThisPhase_p7 = 0
 
 	for i_p7_build_loop = 1, toBuildCount_p7_val do
-		local cand_p7_val = bridgeCandidates_p7_list[i_p7_build_loop] -- Correct
+		local cand_p7_val = bridgeCandidates_p7_list[i_p7_build_loop] 
 		if cand_p7_val and cand_p7_val.p1 and cand_p7_val.p2 then
 			local midX_p7_val = math.floor((cand_p7_val.p1.x + cand_p7_val.p2.x) / 2)
 			local midZ_p7_val = math.floor((cand_p7_val.p1.z + cand_p7_val.p2.z) / 2)
@@ -1010,54 +1121,252 @@ local function Phase7_Bridges() -- This is the function starting around line 571
 			end 
 		end 
 	end 
-	print(string.format("P7 INFO: Built %d bridges from %d candidates. Time: %.2fs", actualBridgesBuiltThisPhase_p7, #bridgeCandidates_p7_list, os.clock() - sTime_p7)) -- Correct variable for count
-end -- End Phase7_Bridges
+	print(string.format("P7 INFO: Built %d bridges from %d candidates. Time: %.2fs", actualBridgesBuiltThisPhase_p7, #bridgeCandidates_p7_list, os.clock() - sTime_p7)) 
+end
 
 local function Phase8_BuildWorld()
-	print("P8 INFO: Starting build world...");local sTime_p8=os.clock();local bSize_p8=Vector3.new(cellSize,cellSize,cellSize);local airBlks_p8,rockBlks_p8=0,0
-	for z_p8=1,gridSizeZ do 
-		for y_p8=1,gridSizeY do 
-			for x_p8=1,gridSizeX do 
-				local cellV_p8=grid:get(x_p8,y_p8,z_p8)
-				local idx_p8=grid:index(x_p8,y_p8,z_p8)
-				local mat_p8
-				if CaveConfig.FloodFillPhaseEnabled and cellV_p8==AIR and not(idx_p8 and mainCaveCellIndices[idx_p8]) then 
-					mat_p8=CaveConfig.RockMaterial
-				elseif cellV_p8==SOLID then 
-					mat_p8=CaveConfig.RockMaterial
-					if CaveConfig.OreVeins.Enabled then 
-						local wx_p8,wy_p8,wz_p8 = origin.X+(x_p8-.5)*cellSize,origin.Y+(y_p8-.5)*cellSize,origin.Z+(z_p8-.5)*cellSize
-						for _,oreD_p8 in ipairs(CaveConfig.OreVeins.OreList) do 
-							if oreD_p8.Rarity>0 then 
-								local oreN_p8=localFractalNoise(wx_p8,wy_p8,wz_p8,oreD_p8.NoiseScale,oreD_p8.Octaves,oreD_p8.Persistence,oreD_p8.Lacunarity)
-								if oreN_p8 > oreD_p8.Threshold and localRandomChance(oreD_p8.Rarity) then 
-									mat_p8=oreD_p8.Material; break 
-								end -- End if oreN_p8
-							end -- End if Rarity > 0
-						end -- End for oreD_p8
-					end -- End if OreVeins.Enabled
-				else 
-					mat_p8=Enum.Material.Air 
-				end -- End if/elseif/else material
+	print("P8 INFO: Starting greedy meshing build world...");
+	local startTime_p8 = os.clock()
+	local airFillBlocks_p8 = 0
+	local solidFillBlocks_p8 = 0
+	local totalFillBlockCalls_p8 = 0
+	local yieldInnerCounter_p8 = 0
+	local YIELD_THRESHOLD_INNER_P8 = CaveConfig.GreedyMesherInnerYieldThreshold or 25000 
 
-				local cellMC_p8=cellToWorld(Vector3.new(x_p8,y_p8,z_p8),origin,cellSize)
-				local blkCtr_p8=cellMC_p8+bSize_p8/2
-				if CaveConfig.DebugMode and (x_p8==1 and y_p8==math.floor(gridSizeY/2) and z_p8%10==0) then 
-					print(string.format("P8 DEBUG: Cell(%d,%d,%d),GridVal:%s,Fill:%s@%s",x_p8,y_p8,z_p8,tostring(cellV_p8),tostring(mat_p8),tostring(blkCtr_p8)))
-				end -- End if DebugMode print
-				Terrain:FillBlock(CFrame.new(blkCtr_p8),bSize_p8,mat_p8)
-				if mat_p8==Enum.Material.Air then airBlks_p8=airBlks_p8+1 else rockBlks_p8=rockBlks_p8+1 end
-				doYield()
-			end -- End for x_p8
-		end -- End for y_p8
-		if CaveConfig.DebugMode or z_p8%math.max(1,math.floor(gridSizeZ/20))==0 then 
-			print(string.format("P8 INFO: Fill %.1f%%(Z %d/%d)",(z_p8/gridSizeZ)*100,z_p8,gridSizeZ))
-		end -- End if DebugMode print
-	end -- End for z_p8
-	print("P8 INFO: AirBlocks:"..airBlks_p8..", RockBlocks:"..rockBlks_p8)
-	local eTime_p8=os.clock()
-	print("P8 INFO: Finished! Time: "..string.format("%.2f",eTime_p8-sTime_p8).."s")
-end -- End Phase8_BuildWorld
+	local processedGrid = Grid3D.new(gridSizeX, gridSizeY, gridSizeZ, false)
+	if not processedGrid or not processedGrid.data then
+		error("P8 CRITICAL: Failed to create 'processedGrid'. Halting Phase 8.")
+		return
+	end
+
+	local function _getCellFinalMaterial_p8(cx, cy, cz)
+		if not grid:isInBounds(cx,cy,cz) then 
+			if CaveConfig.DebugMode then 
+				if math.random(1, 200) == 1 then -- Heavily reduce spam for this trace
+					-- print("P8 Greedy _getCellFinalMaterial_p8 TRACE: Probing OOB: ("..tostring(cx)..","..tostring(cy)..","..tostring(cz)..").")
+				end
+			end
+			return CaveConfig.RockMaterial 
+		end
+
+		local cellValue = grid:get(cx, cy, cz)
+		local cellIndex = grid:index(cx, cy, cz) 
+		local materialToFill
+
+		if cellValue == nil then 
+			if CaveConfig.DebugMode then warn(string.format("P8 Greedy _getCellFinalMaterial_p8 WARN: grid:get returned nil for (%s,%s,%s). Defaulting Rock.", tostring(cx), tostring(cy), tostring(cz))) end
+			return CaveConfig.RockMaterial
+		end
+
+		if CaveConfig.FloodFillPhaseEnabled and cellValue == AIR then
+			if not (cellIndex and mainCaveCellIndices[cellIndex]) then
+				materialToFill = CaveConfig.RockMaterial
+			else
+				materialToFill = Enum.Material.Air
+			end
+		elseif cellValue == SOLID then
+			materialToFill = CaveConfig.RockMaterial
+			if CaveConfig.OreVeins.Enabled then
+				local worldX, worldY, worldZ = origin.X + (cx - 0.5) * cellSize, origin.Y + (cy - 0.5) * cellSize, origin.Z + (cz - 0.5) * cellSize
+				for _, oreData in ipairs(CaveConfig.OreVeins.OreList) do
+					if oreData.Rarity > 0 then
+						local oreNoiseVal = localFractalNoise(worldX, worldY, worldZ,
+							oreData.NoiseScale, oreData.Octaves, oreData.Persistence, oreData.Lacunarity)
+						local threshold = tonumber(oreData.Threshold) or 1.1 
+						local rarity = tonumber(oreData.Rarity) or 0
+						if oreNoiseVal > threshold and localRandomChance(rarity) then
+							materialToFill = oreData.Material
+							break
+						end
+					end
+				end
+			end
+		elseif cellValue == AIR then
+			materialToFill = Enum.Material.Air
+		else
+			if CaveConfig.DebugMode then
+				warn(string.format("P8 Greedy _getCellFinalMaterial_p8 WARNING: Unexpected cell value '%s' at (%s,%s,%s). Defaulting Rock.",
+					tostring(cellValue), tostring(cx), tostring(cy), tostring(cz)))
+			end
+			materialToFill = CaveConfig.RockMaterial
+		end
+
+		if materialToFill == nil then 
+			if CaveConfig.DebugMode then warn(string.format("P8 Greedy _getCellFinalMaterial_p8 CRITICAL FALLBACK: Material unresolved for cell (%s,%s,%s), value %s. Defaulting Rock.", tostring(cx), tostring(cy), tostring(cz), tostring(cellValue))) end
+			return CaveConfig.RockMaterial
+		end
+		return materialToFill
+	end
+
+	local function yieldIfNeeded_p8()
+		yieldInnerCounter_p8 = yieldInnerCounter_p8 + 1
+		if yieldInnerCounter_p8 >= YIELD_THRESHOLD_INNER_P8 then
+			RunService.Heartbeat:Wait()
+			yieldInnerCounter_p8 = 0
+		end
+	end
+
+	for z_loop = 1, gridSizeZ do 
+		for y_loop = 1, gridSizeY do 
+			for x_loop = 1, gridSizeX do 
+				local isCellProcessed = false
+				if processedGrid:isInBounds(x_loop, y_loop, z_loop) then
+					isCellProcessed = processedGrid:get(x_loop, y_loop, z_loop)
+				else 
+					-- This case should ideally not be hit if x_loop,y_loop,z_loop are from 1 to gridSize
+					if CaveConfig.DebugMode then warn("P8 WARNING: Main loop x,y,z out of bounds for processedGrid query. This is unexpected.") end
+				end
+
+				if isCellProcessed == true then
+					continue
+				end
+
+				local startMaterial = _getCellFinalMaterial_p8(x_loop, y_loop, z_loop)
+
+				local meshWidth = 1
+				while true do
+					yieldIfNeeded_p8()
+					local nextX = x_loop + meshWidth
+					if not grid:isInBounds(nextX, y_loop, z_loop) then break end
+					local nextXProcessed = false
+					if processedGrid:isInBounds(nextX,y_loop,z_loop) then 
+						nextXProcessed = processedGrid:get(nextX,y_loop,z_loop) 
+					else 
+						if CaveConfig.DebugMode then warn ("P8 Warning: nextX OOB for processedGrid in width expansion.") end
+						break -- Treat OOB for processedGrid as a hard boundary for safety
+					end
+					if nextXProcessed == true then break end
+					if _getCellFinalMaterial_p8(nextX, y_loop, z_loop) ~= startMaterial then break end
+					meshWidth = meshWidth + 1
+				end
+
+				local meshHeight = 1
+				while true do
+					local nextY = y_loop + meshHeight
+					local scanlineOk = true
+					for dx = 0, meshWidth - 1 do
+						yieldIfNeeded_p8()
+						local currentScanX = x_loop + dx
+						if not grid:isInBounds(currentScanX, nextY, z_loop) then scanlineOk = false; break end
+						local currentScanProcessed = false
+						if processedGrid:isInBounds(currentScanX,nextY,z_loop) then 
+							currentScanProcessed = processedGrid:get(currentScanX,nextY,z_loop) 
+						else
+							if CaveConfig.DebugMode then warn ("P8 Warning: currentScanX,nextY OOB for processedGrid in height expansion.") end
+							scanlineOk = false; break
+						end
+						if currentScanProcessed == true then scanlineOk = false; break end
+						if _getCellFinalMaterial_p8(currentScanX, nextY, z_loop) ~= startMaterial then scanlineOk = false; break end
+					end
+					if not scanlineOk then break end
+					meshHeight = meshHeight + 1
+				end
+
+				local meshDepth = 1
+				while true do
+					local nextZ = z_loop + meshDepth
+					local sliceOk = true
+					for dy = 0, meshHeight - 1 do
+						local currentScanY = y_loop + dy
+						for dx = 0, meshWidth - 1 do
+							yieldIfNeeded_p8()
+							local currentScanX = x_loop + dx
+							if not grid:isInBounds(currentScanX, currentScanY, nextZ) then sliceOk = false; break end
+							local currentScanProcessed = false
+							if processedGrid:isInBounds(currentScanX,currentScanY,nextZ) then 
+								currentScanProcessed = processedGrid:get(currentScanX,currentScanY,nextZ) 
+							else
+								if CaveConfig.DebugMode then warn ("P8 Warning: currentScanX,currentScanY,nextZ OOB for processedGrid in depth expansion.") end
+								sliceOk = false; break
+							end
+							if currentScanProcessed == true then sliceOk = false; break end
+							if _getCellFinalMaterial_p8(currentScanX, currentScanY, nextZ) ~= startMaterial then sliceOk = false; break end
+						end
+						if not sliceOk then break end
+					end
+					if not sliceOk then break end
+					meshDepth = meshDepth + 1
+				end
+
+				totalFillBlockCalls_p8 = totalFillBlockCalls_p8 + 1
+
+				local cuboidWorldSize = Vector3.new(
+					meshWidth * cellSize,
+					meshHeight * cellSize,
+					meshDepth * cellSize
+				)
+				local minCornerWorldPos = cellToWorld(Vector3.new(x_loop, y_loop, z_loop), origin, cellSize)
+				local cuboidCenterWorldPos = minCornerWorldPos + cuboidWorldSize / 2
+
+				if Terrain then
+					Terrain:FillBlock(CFrame.new(cuboidCenterWorldPos), cuboidWorldSize, startMaterial)
+					if startMaterial == Enum.Material.Air then
+						airFillBlocks_p8 = airFillBlocks_p8 + 1
+					else
+						solidFillBlocks_p8 = solidFillBlocks_p8 + 1
+					end
+				end
+
+				for iz_mark = 0, meshDepth - 1 do
+					for iy_mark = 0, meshHeight - 1 do
+						for ix_mark = 0, meshWidth - 1 do
+							yieldIfNeeded_p8()
+							if processedGrid:isInBounds(x_loop + ix_mark, y_loop + iy_mark, z_loop + iz_mark) then
+								processedGrid:set(x_loop + ix_mark, y_loop + iy_mark, z_loop + iz_mark, true)
+							else
+								if CaveConfig.DebugMode then warn ("P8 Warning: Attempt to mark processed OOB for processedGrid.") end
+							end
+						end
+					end
+				end
+
+				local callCountLogFrequency = CaveConfig.GreedyMesherCallCountLogFrequency or 5000 -- Default: log every 5000th cuboid
+				if CaveConfig.DebugMode and totalFillBlockCalls_p8 % callCountLogFrequency == 0 then 
+					print(string.format("P8 Greedy DEBUG (Cuboid Processed): Call #%d. Start(%d,%d,%d) Dims(%d,%d,%d) Mat:%s",
+						totalFillBlockCalls_p8, x_loop,y_loop,z_loop, meshWidth, meshHeight, meshDepth, tostring(startMaterial)))
+				end
+
+				doYield() -- Original script-level yield counter
+			end -- End x_loop 
+		end -- End y_loop
+
+		-- V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V
+		-- CORRECTED AND SINGLE Z-SLICE PROGRESS INFO PRINT LOGIC:
+		-- V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V V
+		local logThisZSlice = false
+		if CaveConfig.DebugMode then
+			-- Behavior when DebugMode is ON:
+			-- Use GreedyMesherZSliceLogDivisor_DebugMode from config, default to 1 (print every Z-slice if DebugMode is true)
+			local zSliceDebugLogDivisor = CaveConfig.GreedyMesherZSliceLogDivisor_DebugMode or 1 
+			if z_loop % math.max(1, zSliceDebugLogDivisor) == 0 then -- Note: using direct modulo, not floor(gridSizeZ/divisor) for this mode
+				logThisZSlice = true
+			end
+		else
+			-- Behavior when DebugMode is OFF:
+			-- Use GreedyMesherZSliceLogDivisor_ReleaseMode from config, default to aiming for ~10 prints
+			local zSliceReleaseLogDivisor = CaveConfig.GreedyMesherZSliceLogDivisor_ReleaseMode or 10 
+			-- Print for first, last, and periodically based on the divisor's intent to give N total prints
+			if z_loop == 1 or z_loop == gridSizeZ or z_loop % math.max(1, math.floor(gridSizeZ / zSliceReleaseLogDivisor)) == 0 then
+				logThisZSlice = true
+			end
+		end
+
+		if logThisZSlice then
+			print(string.format("P8 Greedy INFO: Z-slice %d/%d. Total Calls: %d (AirGroups: %d, SolidGroups: %d)",
+				z_loop, gridSizeZ, totalFillBlockCalls_p8, airFillBlocks_p8, solidFillBlocks_p8))
+		end
+		-- ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ 
+		-- END OF CORRECTED Z-SLICE PROGRESS INFO PRINT LOGIC
+		-- ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ 
+
+	end -- End z_loop
+
+	-- Final summary print for Phase 8 (basic version, no detailed cuboid stats for now)
+	print(string.format("P8 INFO: Greedy meshing build complete. Total Terrain:FillBlock calls: %d (Air groups: %d, Solid/Ore groups: %d)", 
+		totalFillBlockCalls_p8, airFillBlocks_p8, solidFillBlocks_p8))
+	local endTime_p8 = os.clock()
+	print("P8 INFO: Finished! Time: " .. string.format("%.2f", endTime_p8 - startTime_p8) .. "s")
+end
 
 -- =============================================================================
 -- VI. MAIN EXECUTION
