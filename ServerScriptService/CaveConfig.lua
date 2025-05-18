@@ -5,7 +5,7 @@ local Config = {}
 --------------------------------------------------------------------------------
 -- I. GENERAL SETTINGS
 --------------------------------------------------------------------------------
-Config.Seed = math.random(1, 100000) -- Or your preferred static seed like 67896
+Config.Seed = 12345 -- Or your preferred static seed like 67896
 Config.DebugMode = true -- START WITH TRUE for initial runs of this new config. Set to false later for speed.
 
 Config.RegionSize    = Vector3.new(1024, 512, 1024)
@@ -70,6 +70,29 @@ Config.P1_BroadStructure_Threshold = 0.52        -- STARTING POINT.
 -- This is very sensitive. If too many broad solid cells: decrease to 0.50, 0.48.
 -- If too few broad solid (still slow P1): increase to 0.55.
 -- The goal is that this broad pass marks ~30-60% of cells as SOLID.
+
+--------------------------------------------------------------------------------
+-- III.D. PHASE 1 - SURFACE ADAPTIVE FBM (for Detailed Pass)
+--------------------------------------------------------------------------------
+Config.P1_UseSurfaceAdaptiveFBM = false -- Set to true to enable Surface Adaptive FBM for the detailed pass
+-- If true, the detailed pass will use Perlin.FBM_SurfaceAdaptive instead of Perlin.FBM_Base.
+-- Config.P1_Octaves will serve as the 'maxOctaves' parameter for FBM_SurfaceAdaptive.
+-- Config.P1_NoiseScale will serve as the 'frequency' parameter.
+
+Config.P1_Adaptive_TargetThreshold = 0.45 -- Value in [0,1]. Noise values (pre-bias) near this will get more octaves.
+-- This is the threshold the adaptive algorithm aims for.
+-- A common starting point might be 0.5, or aligned with Config.Threshold.
+
+Config.P1_Adaptive_NearSurfaceOctaves = 6 -- Number of octaves to calculate when the noise is near the TargetThreshold.
+-- Will be internally clamped by Config.P1_Octaves (as maxOctaves).
+-- Example: If P1_Octaves = 5, and this is 6, effectively 5 octaves will be used.
+
+Config.P1_Adaptive_FarSurfaceOctaves = 2  -- Number of octaves for the initial estimate and when noise is far from TargetThreshold.
+-- Should be less than P1_Adaptive_NearSurfaceOctaves.
+
+Config.P1_Adaptive_TransitionRange = 0.1  -- Range around TargetThreshold (e.g., Target +/- Range) to transition
+-- from FarSurfaceOctaves to NearSurfaceOctaves.
+
 
 --------------------------------------------------------------------------------
 -- PHASE 2: Rock Formations
