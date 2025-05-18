@@ -285,63 +285,105 @@ local mainCaveCellIndices = {}
 -- =============================================================================
 local function Phase1_InitialCaveFormation()
 	print("Phase 1 INFO: Starting initial cave structure...")
+	if CaveConfig.P1_UseDomainWarp then
+		print("Phase 1 INFO: Domain Warping is ENABLED.")
+		print(string.format("    DW Params: Strength=%.2f, FreqFactor=%.3f, Octaves=%d, Pers=%.2f, Lacu=%.2f",
+			CaveConfig.P1_DomainWarp_Strength, CaveConfig.P1_DomainWarp_FrequencyFactor,
+			CaveConfig.P1_DomainWarp_Octaves, CaveConfig.P1_DomainWarp_Persistence, CaveConfig.P1_DomainWarp_Lacunarity))
+	else
+		print("Phase 1 INFO: Domain Warping is DISABLED.")
+	end
 	local startTime = os.clock()
 	local airCellsSetInP1 = 0
-	local exampleFinalDensityForSlice 
+	local exampleFinalDensityForSlice
+
 	for z = 1, gridSizeZ do
 		for y = 1, gridSizeY do
 			for x = 1, gridSizeX do
-				local worldX = origin.X + (x - 0.5) * cellSize
-				local worldY = origin.Y + (y - 0.5) * cellSize
-				local worldZ = origin.Z + (z - 0.5) * cellSize
+				local worldX_orig = origin.X + (x - 0.5) * cellSize
+				local worldY_orig = origin.Y + (y - 0.5) * cellSize
+				local worldZ_orig = origin.Z + (z - 0.5) * cellSize
 
-				local noiseVal = localFractalNoise(worldX, worldY, worldZ, 
-					CaveConfig.P1_NoiseScale, 
-					CaveConfig.P1_Octaves, 
-					CaveConfig.P1_Persistence, 
+				local worldX_input = worldX_orig
+				local worldY_input = worldY_orig
+				local worldZ_input = worldZ_orig
+
+				if CaveConfig.P1_UseDomainWarp then
+					local warpedX, warpedY, warpedZ = Perlin.DomainWarp(
+						worldX_orig, worldY_orig, worldZ_orig,
+						CaveConfig.P1_DomainWarp_FrequencyFactor,
+						CaveConfig.P1_DomainWarp_Strength,
+						nil, -- Use default Perlin.Noise_Raw from Perlin.lua's DomainWarp
+						CaveConfig.P1_DomainWarp_Octaves,
+						CaveConfig.P1_DomainWarp_Persistence,
+						CaveConfig.P1_DomainWarp_Lacunarity
+					)
+					worldX_input = warpedX
+					worldY_input = warpedY
+					worldZ_input = warpedZ
+
+					-- Optional: Debug print for a few initial cells to see warp effect
+					if CaveConfig.DebugMode and x <= 1 and y <= 1 and z <= 1 then
+						local iterationNum = (z-1)*gridSizeX*gridSizeY + (y-1)*gridSizeX + x
+						if iterationNum <= 2 then -- Print for first couple of cells
+							print(string.format("P1 DW DEBUG: Cell(%d,%d,%d) Orig(%0.2f,%0.2f,%0.2f) -> Warped(%0.2f,%0.2f,%0.2f)",
+								x,y,z, worldX_orig, worldY_orig, worldZ_orig, warpedX, warpedY, warpedZ))
+						end
+					end
+				end
+
+				local noiseVal = localFractalNoise(worldX_input, worldY_input, worldZ_input,
+					CaveConfig.P1_NoiseScale,
+					CaveConfig.P1_Octaves,
+					CaveConfig.P1_Persistence,
 					CaveConfig.P1_Lacunarity)
-				local hBias = localHeightBias(y, gridSizeY)
-				local dBias = localDistanceToCenterBias(x, y, z, 
+
+				-- Biases still use original world coordinates.
+				-- You might experiment with using warped coordinates for biases too,
+				-- but for now, this will warp the base shape and biases apply on top.
+				local hBias = localHeightBias(y, gridSizeY) -- Based on grid cell y
+				local dBias = localDistanceToCenterBias(x, y, z, -- Based on grid cell x,y,z
 					gridSizeX, gridSizeY, gridSizeZ, CaveConfig.P1_DistanceBias_Max)
-				local vConnBias = localVerticalConnectivityNoise(worldX, worldY, worldZ, 
+				local vConnBias = localVerticalConnectivityNoise(worldX_orig, worldY_orig, worldZ_orig, -- Uses original world coords
 					CaveConfig.P1_NoiseScale)
 
-				local finalDensity = noiseVal + 
-					hBias + 
-					dBias + 
-					vConnBias -- MultiLineStatement: Ensured reasonable indent
+				local finalDensity = noiseVal +
+					hBias +
+					dBias +
+					vConnBias
 
-				if x == math.floor(gridSizeX/2) and y == math.floor(gridSizeY/2) then 
-					exampleFinalDensityForSlice = finalDensity 
+				if x == math.floor(gridSizeX/2) and y == math.floor(gridSizeY/2) then
+					exampleFinalDensityForSlice = finalDensity
 				end
 
 				if finalDensity < CaveConfig.Threshold then
 					grid:set(x, y, z, AIR); airCellsSetInP1 = airCellsSetInP1 + 1
-					if airCellsSetInP1 < 15 and CaveConfig.DebugMode then 
-						print(string.format("P1 DEBUG: Cell(%d,%d,%d) SET TO AIR. finalDensity=%.4f, Thresh=%.4f",x,y,z,finalDensity,CaveConfig.Threshold)) 
+					if airCellsSetInP1 < 15 and CaveConfig.DebugMode then
+						print(string.format("P1 DEBUG: Cell(%d,%d,%d) SET TO AIR. finalDensity=%.4f (Noise=%.3f), Thresh=%.4f",x,y,z,finalDensity,noiseVal,CaveConfig.Threshold))
 					end
-				else 
-					grid:set(x, y, z, SOLID) 
-				end -- End if finalDensity
+				else
+					grid:set(x, y, z, SOLID)
+				end
 				doYield()
 			end -- End for x
 		end -- End for y
-		if CaveConfig.DebugMode and z % 20 == 0 then 
-			if exampleFinalDensityForSlice then 
+		if CaveConfig.DebugMode and z % 20 == 0 then
+			if exampleFinalDensityForSlice then
 				print(string.format("P1 DEBUG: Z-slice %d. Sample Density (mid): %.4f for Thresh %.4f",z,exampleFinalDensityForSlice,CaveConfig.Threshold))
-			else 
-				print(string.format("P1 DEBUG: Z-slice %d done.", z)) 
+			else
+				print(string.format("P1 DEBUG: Z-slice %d done.", z))
 			end
-		end -- End if DebugMode print
+		end
 	end -- End for z
-	for z_b = 1, gridSizeZ do 
-		for x_b = 1, gridSizeX do 
+
+	for z_b = 1, gridSizeZ do
+		for x_b = 1, gridSizeX do
 			for y_b = 1, gridSizeY do
 				if y_b <= CaveConfig.FormationStartHeight_Cells then grid:set(x_b,y_b,z_b,SOLID) end
 				if x_b==1 or x_b==gridSizeX or z_b==1 or z_b==gridSizeZ then grid:set(x_b,y_b,z_b,SOLID) end
-			end -- End for y_b
-		end -- End for x_b
-	end -- End for z_b
+			end
+		end
+	end
 	if CaveConfig.DebugMode then print("P1 DEBUG: Borders solidified.") end
 	print("P1 INFO: Total cells set to AIR in P1: " .. airCellsSetInP1)
 	local endTime = os.clock(); print("P1 INFO: Finished! Time: " .. string.format("%.2f", endTime - startTime) .. "s")
