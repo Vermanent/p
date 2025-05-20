@@ -411,47 +411,121 @@ function Perlin.DomainWarp(x,y,z, warpFreqFactor, warpStr, warpNoiseFunc, warpOc
 end
 
 local CURL_EPSILON = 0.01 
-function Perlin.CurlNoise(x,y,z, baseFreq, curlNoiseFunc, curlOctaves, curlPersistence, curlLacunarity)
-	baseFreq = baseFreq or Config.Curl_DefaultFrequencyFactor
-	curlNoiseFunc = curlNoiseFunc or Perlin.Noise_Raw
-
-	local px_potential, py_potential, pz_potential
-
-	if curlOctaves and curlOctaves > 0 then
-		local getFBM_PotentialComponent = function(vx,vy,vz,seedOffset)
-			return Perlin.FBM_Base(vx,vy,vz,
-				curlOctaves,
-				curlPersistence or Config.FBM_DefaultPersistence,
-				curlLacunarity or Config.FBM_DefaultLacunarity,
-				1.0,
-				1.0,
-				function(nx,ny,nz) return Perlin.Noise_Raw(nx+seedOffset,ny+seedOffset,nz+seedOffset) end
-			)
-		end
-		px_potential = function(lx,ly,lz) return getFBM_PotentialComponent(lx*baseFreq, ly*baseFreq, lz*baseFreq, 123.45) end
-		py_potential = function(lx,ly,lz) return getFBM_PotentialComponent(lx*baseFreq, ly*baseFreq, lz*baseFreq, 678.91) end
-		pz_potential = function(lx,ly,lz) return getFBM_PotentialComponent(lx*baseFreq, ly*baseFreq, lz*baseFreq, 234.56) end
-	else
-		px_potential = function(lx,ly,lz) return Perlin.Noise(lx*baseFreq+123.45, ly*baseFreq+0,      lz*baseFreq+0) end
-		py_potential = function(lx,ly,lz) return Perlin.Noise(lx*baseFreq+0,      ly*baseFreq+678.91, lz*baseFreq+0) end
-		pz_potential = function(lx,ly,lz) return Perlin.Noise(lx*baseFreq+0,      ly*baseFreq+0,      lz*baseFreq+234.56) end
+function Perlin.CurlNoise(x,y,z, baseFreq, curlNoiseFunc_param_not_used, curlOctaves, curlPersistence, curlLacunarity)
+	-- Initial Parameter Sanity Check
+	if type(x)~="number" or x~=x or type(y)~="number" or y~=y or type(z)~="number" or z~=z then
+		error(string.format("CurlNoise Initial Coord Error: x(%s,%s) y(%s,%s) z(%s,%s)", type(x),tostring(x),type(y),tostring(y),type(z),tostring(z)),0)
+	end
+	if type(baseFreq)~="number" or baseFreq~=baseFreq then
+		error(string.format("CurlNoise Initial baseFreq Error: baseFreq(%s,%s)", type(baseFreq), tostring(baseFreq)),0)
+	end
+	if curlOctaves and (type(curlOctaves)~="number" or curlOctaves~=curlOctaves) then
+		error(string.format("CurlNoise Initial octaves Error: octaves(%s,%s)", type(curlOctaves),tostring(curlOctaves)),0)
+	end
+	if type(CURL_EPSILON)~="number" or CURL_EPSILON~=CURL_EPSILON or CURL_EPSILON==0 then -- Also check epsilon for zero
+		error(string.format("CurlNoise CURL_EPSILON invalid: (%s,%s)",type(CURL_EPSILON),tostring(CURL_EPSILON)),0)
 	end
 
-	local dPy_dz = (py_potential(x,y,z+CURL_EPSILON) - py_potential(x,y,z-CURL_EPSILON)) / (2*CURL_EPSILON)
-	local dPz_dy = (pz_potential(x,y+CURL_EPSILON,z) - pz_potential(x,y-CURL_EPSILON,z)) / (2*CURL_EPSILON)
 
-	local dPz_dx = (pz_potential(x+CURL_EPSILON,y,z) - pz_potential(x-CURL_EPSILON,y,z)) / (2*CURL_EPSILON)
-	local dPx_dz = (px_potential(x,y,z+CURL_EPSILON) - px_potential(x,y,z-CURL_EPSILON)) / (2*CURL_EPSILON)
+	baseFreq = baseFreq or Config.Curl_DefaultFrequencyFactor
 
-	local dPx_dy = (px_potential(x,y+CURL_EPSILON,z) - px_potential(x,y-CURL_EPSILON,z)) / (2*CURL_EPSILON)
-	local dPy_dx = (py_potential(x+CURL_EPSILON,y,z) - py_potential(x-CURL_EPSILON,y,z)) / (2*CURL_EPSILON)
+	local px_potential_func, py_potential_func, pz_potential_func
 
-	local curlVec = Vector3.new(dPy_dz-dPz_dy, dPz_dx-dPx_dz, dPx_dy-dPy_dx)
+	if curlOctaves and curlOctaves > 0 then
+		local getFBM_PotentialComponent = function(vx,vy,vz, fbm_frequency_param, fbm_octaves_param, fbm_persistence_param, fbm_lacunarity_param, seedOffset_for_raw_noise)
+			local fbm_result = Perlin.FBM_Base(vx,vy,vz, 
+				fbm_octaves_param,
+				fbm_persistence_param, 
+				fbm_lacunarity_param,  
+				fbm_frequency_param,   
+				1.0,                   
+				function(raw_nx,raw_ny,raw_nz) 
+					local raw_noise_res = Perlin.Noise_Raw(raw_nx+seedOffset_for_raw_noise, raw_ny+seedOffset_for_raw_noise, raw_nz+seedOffset_for_raw_noise)
+					if type(raw_noise_res) ~= "number" then
+						error("Noise_Raw inside FBM_Base lambda returned " .. type(raw_noise_res) .. "("..tostring(raw_noise_res)..") Coords: " .. tostring(raw_nx+seedOffset_for_raw_noise), 0)
+					elseif raw_noise_res ~= raw_noise_res then
+						error("Noise_Raw inside FBM_Base lambda returned NaN. Coords: " .. tostring(raw_nx+seedOffset_for_raw_noise), 0)
+					end
+					return raw_noise_res
+				end 
+			)
+			if type(fbm_result) ~= "number" then
+				error("getFBM_PotentialComponent: FBM_Base returned " .. type(fbm_result) .. "("..tostring(fbm_result)..") Input coords to FBM: "..tostring(vx)..", "..tostring(vy)..", "..tostring(vz) .. " Freq: "..tostring(fbm_frequency_param) , 0)
+			elseif fbm_result ~= fbm_result then
+				error("getFBM_PotentialComponent: FBM_Base returned NaN. Input coords to FBM: "..tostring(vx)..", "..tostring(vy)..", "..tostring(vz).. " Freq: "..tostring(fbm_frequency_param), 0)
+			end
+			return fbm_result
+		end
+
+		px_potential_func = function(lx,ly,lz) return getFBM_PotentialComponent(lx, ly, lz, baseFreq, curlOctaves, curlPersistence or Config.FBM_DefaultPersistence, curlLacunarity or Config.FBM_DefaultLacunarity, 123.45) end
+		py_potential_func = function(lx,ly,lz) return getFBM_PotentialComponent(lx, ly, lz, baseFreq, curlOctaves, curlPersistence or Config.FBM_DefaultPersistence, curlLacunarity or Config.FBM_DefaultLacunarity, 678.91) end 
+		pz_potential_func = function(lx,ly,lz) return getFBM_PotentialComponent(lx, ly, lz, baseFreq, curlOctaves, curlPersistence or Config.FBM_DefaultPersistence, curlLacunarity or Config.FBM_DefaultLacunarity, 234.56) end 
+	else
+		px_potential_func = function(lx,ly,lz) return Perlin.Noise((lx*baseFreq)+123.45, (ly*baseFreq)+0,      (lz*baseFreq)+0) end
+		py_potential_func = function(lx,ly,lz) return Perlin.Noise((lx*baseFreq)+0,      (ly*baseFreq)+678.91, (lz*baseFreq)+0) end
+		pz_potential_func = function(lx,ly,lz) return Perlin.Noise((lx*baseFreq)+0,      (ly*baseFreq)+0,      (lz*baseFreq)+234.56) end
+	end
+
+	local val_px_z_plus, val_px_z_minus
+	local val_py_z_plus, val_py_z_minus
+	local val_pz_y_plus, val_pz_y_minus
+	local val_pz_x_plus, val_pz_x_minus
+	local val_px_y_plus, val_px_y_minus
+	local val_py_x_plus, val_py_x_minus
+
+	val_px_z_plus = px_potential_func(x,y,z+CURL_EPSILON)
+	if type(val_px_z_plus)=="nil" then error("val_px_z_plus IS LUA NIL. px_potential_func(x,y,z+eps)",0) elseif type(val_px_z_plus)~="number" then error("val_px_z_plus type "..type(val_px_z_plus),0) elseif val_px_z_plus~=val_px_z_plus then error("val_px_z_plus is NaN",0) end
+	val_px_z_minus = px_potential_func(x,y,z-CURL_EPSILON)
+	if type(val_px_z_minus)=="nil" then error("val_px_z_minus IS LUA NIL. px_potential_func(x,y,z-eps)",0) elseif type(val_px_z_minus)~="number" then error("val_px_z_minus type "..type(val_px_z_minus),0) elseif val_px_z_minus~=val_px_z_minus then error("val_px_z_minus is NaN",0) end
+	local dPx_dz = (val_px_z_plus - val_px_z_minus) / (2*CURL_EPSILON)
+
+	val_py_z_plus = py_potential_func(x,y,z+CURL_EPSILON)
+	if type(val_py_z_plus)=="nil" then error("val_py_z_plus IS LUA NIL. py_potential_func(x,y,z+eps)",0) elseif type(val_py_z_plus)~="number" then error("val_py_z_plus type "..type(val_py_z_plus),0) elseif val_py_z_plus~=val_py_z_plus then error("val_py_z_plus is NaN",0) end
+	val_py_z_minus = py_potential_func(x,y,z-CURL_EPSILON)
+	if type(val_py_z_minus)=="nil" then error("val_py_z_minus IS LUA NIL. py_potential_func(x,y,z-eps)",0) elseif type(val_py_z_minus)~="number" then error("val_py_z_minus type "..type(val_py_z_minus),0) elseif val_py_z_minus~=val_py_z_minus then error("val_py_z_minus is NaN",0) end
+	local dPy_dz = (val_py_z_plus - val_py_z_minus) / (2*CURL_EPSILON)
+
+	val_pz_y_plus = pz_potential_func(x,y+CURL_EPSILON,z)
+	if type(val_pz_y_plus)=="nil" then error("val_pz_y_plus IS LUA NIL. pz_potential_func(x,y+eps,z)",0) elseif type(val_pz_y_plus)~="number" then error("val_pz_y_plus type "..type(val_pz_y_plus),0) elseif val_pz_y_plus~=val_pz_y_plus then error("val_pz_y_plus is NaN",0) end
+	val_pz_y_minus = pz_potential_func(x,y-CURL_EPSILON,z)
+	if type(val_pz_y_minus)=="nil" then error("val_pz_y_minus IS LUA NIL. pz_potential_func(x,y-eps,z)",0) elseif type(val_pz_y_minus)~="number" then error("val_pz_y_minus type "..type(val_pz_y_minus),0) elseif val_pz_y_minus~=val_pz_y_minus then error("val_pz_y_minus is NaN",0) end
+	local dPz_dy = (val_pz_y_plus - val_pz_y_minus) / (2*CURL_EPSILON)
+
+	val_pz_x_plus = pz_potential_func(x+CURL_EPSILON,y,z)
+	if type(val_pz_x_plus)=="nil" then error("val_pz_x_plus IS LUA NIL. pz_potential_func(x+eps,y,z)",0) elseif type(val_pz_x_plus)~="number" then error("val_pz_x_plus type "..type(val_pz_x_plus),0) elseif val_pz_x_plus~=val_pz_x_plus then error("val_pz_x_plus is NaN",0) end
+	val_pz_x_minus = pz_potential_func(x-CURL_EPSILON,y,z)
+	if type(val_pz_x_minus)=="nil" then error("val_pz_x_minus IS LUA NIL. pz_potential_func(x-eps,y,z)",0) elseif type(val_pz_x_minus)~="number" then error("val_pz_x_minus type "..type(val_pz_x_minus),0) elseif val_pz_x_minus~=val_pz_x_minus then error("val_pz_x_minus is NaN",0) end
+	local dPz_dx = (val_pz_x_plus - val_pz_x_minus) / (2*CURL_EPSILON)
+
+	val_px_y_plus = px_potential_func(x,y+CURL_EPSILON,z)
+	if type(val_px_y_plus)=="nil" then error("val_px_y_plus IS LUA NIL. px_potential_func(x,y+eps,z)",0) elseif type(val_px_y_plus)~="number" then error("val_px_y_plus type "..type(val_px_y_plus),0) elseif val_px_y_plus~=val_px_y_plus then error("val_px_y_plus is NaN",0) end
+	val_px_y_minus = px_potential_func(x,y-CURL_EPSILON,z) 
+	if type(val_px_y_minus)=="nil" then error("val_px_y_minus IS LUA NIL. px_potential_func(x,y-eps,z)",0) elseif type(val_px_y_minus)~="number" then error("val_px_y_minus type "..type(val_px_y_minus),0) elseif val_px_y_minus~=val_px_y_minus then error("val_px_y_minus is NaN",0) end
+	local dPx_dy = (val_px_y_plus - val_px_y_minus) / (2*CURL_EPSILON)
+
+	val_py_x_plus = py_potential_func(x+CURL_EPSILON,y,z)
+	if type(val_py_x_plus)=="nil" then error("val_py_x_plus IS LUA NIL. py_potential_func(x+eps,y,z)",0) elseif type(val_py_x_plus)~="number" then error("val_py_x_plus type "..type(val_py_x_plus),0) elseif val_py_x_plus~=val_py_x_plus then error("val_py_x_plus is NaN",0) end
+	val_py_x_minus = py_potential_func(x-CURL_EPSILON,y,z)
+	if type(val_py_x_minus)=="nil" then error("val_py_x_minus IS LUA NIL. py_potential_func(x-eps,y,z)",0) elseif type(val_py_x_minus)~="number" then error("val_py_x_minus type "..type(val_py_x_minus),0) elseif val_py_x_minus~=val_py_x_minus then error("val_py_x_minus is NaN",0) end
+	local dPy_dx = (val_py_x_plus - val_py_x_minus) / (2*CURL_EPSILON)
+
+	if dPy_dz~=dPy_dz or dPz_dy~=dPz_dy or dPz_dx~=dPz_dx or dPx_dz~=dPx_dz or dPx_dy~=dPx_dy or dPy_dx~=dPy_dx then
+		local err_msg_deriv_nan = "Perlin.CurlNoise Error PostCalc: One or more final derivatives are NaN. Input xyz("..tostring(x)..","..tostring(y)..","..tostring(z).."). Derivs: dPy_dz:"..tostring(dPy_dz)..", dPz_dy:"..tostring(dPz_dy)..", dPz_dx:"..tostring(dPz_dx)..", dPx_dz:"..tostring(dPx_dz)..", dPx_dy:"..tostring(dPx_dy)..", dPy_dx:"..tostring(dPy_dx)
+		error(err_msg_deriv_nan, 0)
+	end
+
+	local curlVec = Vector3.new(
+		dPy_dz - dPz_dy, 
+		dPz_dx - dPx_dz, 
+		dPx_dy - dPy_dx
+	)
+
 	if curlVec.Magnitude > 1e-6 then
 		return curlVec.Unit 
 	else
-		return Vector3.zero
+		return Vector3.zero 
 	end
 end
+
 
 return Perlin
