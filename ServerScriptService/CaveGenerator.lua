@@ -1496,6 +1496,456 @@ local function Phase8_BuildWorld()
 	print("P8 INFO: Finished! Time: " .. string.format("%.2f", endTime_p8 - startTime_p8) .. "s")
 end
 
+-- Helper: Selects a direction from 'choices' most aligned with 'targetDirection'
+local function selectBestAxialDirection(targetDirection, choices, axialDirsList)
+	if not choices or #choices == 0 then return axialDirsList[localRandomInt(1, #axialDirsList)] end -- Failsafe
+
+	local bestDir = choices[1]
+	local maxDot = -math.huge -- Can be negative if all choices are opposite to target
+
+	-- If targetDirection is effectively zero, pick a random choice from provided options
+	if targetDirection.Magnitude < 1e-4 then
+		return choices[localRandomInt(1, #choices)]
+	end
+
+	local normalizedTargetDir = targetDirection.Unit -- Normalize for consistent dot products
+
+	for _, choiceDir in ipairs(choices) do
+		local dot = normalizedTargetDir:Dot(choiceDir) -- choiceDir is already axial unit
+		if dot > maxDot then
+			maxDot = dot
+			bestDir = choiceDir
+		end
+	end
+	return bestDir
+end
+
+-- Helper: Get orthogonal axial directions to a given axial direction
+local AXIAL_DIRECTIONS = {
+	Vector3.new(1,0,0), Vector3.new(-1,0,0),
+	Vector3.new(0,1,0), Vector3.new(0,-1,0),
+	Vector3.new(0,0,1), Vector3.new(0,0,-1)
+}
+local AXIAL_DIRECTIONS_MAP = { -- For quick lookups
+	[Vector3.new(1,0,0)] = true, [Vector3.new(-1,0,0)] = true,
+	[Vector3.new(0,1,0)] = true, [Vector3.new(0,-1,0)] = true,
+	[Vector3.new(0,0,1)] = true, [Vector3.new(0,0,-1)] = true,
+}
+
+-- [[ Add this helper function to CaveGenerator.lua, near your other helpers ]]
+local function rotateVectorAroundAxis(vecToRotate, axis, angleRadians)
+	-- Create a CFrame that represents the rotation
+	local rotationCFrame = CFrame.fromAxisAngle(axis.Unit, angleRadians)
+	-- Apply the rotation to the vector (treating vector as a direction)
+	return (rotationCFrame * vecToRotate)
+end
+
+local function getOrthogonalAxialDirections(dirVec, avoidReverse)
+	local orthos = {}
+	local reverseDir = -dirVec
+	for _, axialDir in ipairs(AXIAL_DIRECTIONS) do
+		if math.abs(axialDir:Dot(dirVec)) < 0.01 then -- Perpendicular
+			table.insert(orthos, axialDir)
+		end
+	end
+	if avoidReverse then -- this logic is a bit off here, avoidReverse applies to picking *from* orthos + forward
+		-- the main point is that orthos will never contain dirVec or -dirVec
+	end
+	-- Fallback if dirVec was not perfectly axial or zero (should not happen with current design)
+	if #orthos == 0 then
+		warn("getOrthogonalAxialDirections: Could not find orthos for dir", dirVec, ". Defaulting.")
+		return {AXIAL_DIRECTIONS[3],AXIAL_DIRECTIONS[4],AXIAL_DIRECTIONS[5],AXIAL_DIRECTIONS[6]} -- pick some non-collinear defaults
+	end
+	return orthos
+end
+
+-- Helper for carving sphere
+local function _carveSphereAgentTunnels(targetGrid, cX, cY, cZ, radiusCells, materialToCarve)
+	local R = math.max(0, math.floor(radiusCells)) -- Ensure radius is non-negative integer
+	local cellsChanged = 0
+	for dz_s = -R, R do
+		for dy_s = -R, R do
+			for dx_s = -R, R do
+				if dx_s*dx_s + dy_s*dy_s + dz_s*dz_s <= R*R + 0.1 then -- Check if inside sphere
+					local nx, ny, nz = cX + dx_s, cY + dy_s, cZ + dz_s
+					if targetGrid:isInBounds(nx, ny, nz) then
+						if targetGrid:get(nx, ny, nz) ~= materialToCarve then
+							cellsChanged = cellsChanged + 1
+						end
+						targetGrid:set(nx, ny, nz, materialToCarve)
+					end
+				end
+			end
+		end
+	end
+	return cellsChanged
+end
+
+local nextAgentId = 1
+
+-- =============================================================================
+-- NEW PHASE: AGENT TUNNELS
+-- =============================================================================
+local function Phase_AgentTunnels()
+	if not CaveConfig.AgentTunnels_Enabled then
+		print("Phase_AgentTunnels INFO: Skipped as not enabled in CaveConfig.")
+		return
+	end
+	print("Phase_AgentTunnels INFO: Starting agent-based tunneling ('Worms')...")
+	local startTime = os.clock()
+
+	local activeAgents = {}
+	local totalAgentMovementSteps = 0
+	local agentsSpawnedTotal = 0
+	local nextAgentId = 1 
+
+	-- ========= TIMEOUT FIX: Initialization Start =========
+	local YIELD_AGENT_BATCH_SIZE = 10 -- ### NEW: Yield after processing this many agents. START WITH 10. Adjust UP (e.g., 20, 50) if it's too slow, or DOWN (e.g., 5) if still timing out.
+	local agentProcessingCounter = 0   -- ### NEW: Counter for the batch
+	-- ========= TIMEOUT FIX: Initialization End ===========
+
+	-- Initialize Agents (your existing code for this block, I'm omitting it for brevity here)
+	-- for i = 1, CaveConfig.AgentTunnels_NumInitialAgents do
+	--     ...
+	-- end
+	for i = 1, CaveConfig.AgentTunnels_NumInitialAgents do
+		local startPosGrid = nil -- Integer grid coordinates for start
+
+		if CaveConfig.AgentTunnels_StartPolicy == "RandomAirInGrid" then
+			local attempts = 100
+			local foundStart = false 
+			for _ = 1, attempts do
+				local sx_rand = localRandomInt(2, gridSizeX - 1)
+				local sy_rand = localRandomInt(CaveConfig.FormationStartHeight_Cells + 2, gridSizeY - 2)
+				local sz_rand = localRandomInt(2, gridSizeZ - 1)
+
+				if grid:get(sx_rand, sy_rand, sz_rand) == AIR then
+					startPosGrid = {x=sx_rand, y=sy_rand, z=sz_rand}
+					foundStart = true
+					break
+				end
+			end
+			if not foundStart then 
+				startPosGrid = {
+					x=localRandomInt(math.floor(gridSizeX*0.25), math.floor(gridSizeX*0.75)),
+					y=localRandomInt(math.floor(gridSizeY*0.25), math.floor(gridSizeY*0.75)),
+					z=localRandomInt(math.floor(gridSizeZ*0.25), math.floor(gridSizeZ*0.75))
+				}
+				if CaveConfig.DebugMode then print("Phase_AgentTunnels DEBUG: Agent " .. (nextAgentId) .. " (initial) using fallback start point after failing to find AIR cell.") end
+			end
+
+		elseif  CaveConfig.AgentTunnels_StartPolicy == "MainCaveAir" then
+			local mainAirCellsSample = {}
+			local attemptsToFindMainAir = 0
+
+			-- Prioritize using existing mainCaveCellIndices if P4/P5 populated it
+			if mainCaveCellIndices and next(mainCaveCellIndices) ~= nil then
+				if CaveConfig.DebugMode then print("PAT DEBUG: Attempting to use mainCaveCellIndices for MainCaveAir starts.") end
+				local candidateCells = {}
+				-- This iteration can be slow if mainCaveCellIndices is huge.
+				-- We should pick random cells from it more efficiently if possible, or sample.
+				-- For now, simple iteration with a cap:
+				local collected = 0
+				for x_mc=1, gridSizeX do
+					if collected > 20000 then break end -- Safety break from too many iterations if grid is large
+					for y_mc=1, gridSizeY do
+						if collected > 20000 then break end
+						for z_mc=1, gridSizeZ do
+							local idx = grid:index(x_mc, y_mc, z_mc)
+							if idx and mainCaveCellIndices[idx] and grid:get(x_mc, y_mc, z_mc) == AIR then
+								table.insert(candidateCells, {x=x_mc, y=y_mc, z=z_mc})
+								collected = collected + 1
+								if collected > 20000 then break end -- Limit how many candidates we collect
+							end
+						end
+					end
+				end
+
+				if #candidateCells > 0 then
+					-- Sample from the collected candidates
+					for _=1, math.min(CaveConfig.AgentTunnels_NumInitialAgents * 5, #candidateCells) do -- Oversample a bit
+						table.insert(mainAirCellsSample, candidateCells[localRandomInt(1, #candidateCells)])
+					end
+					if CaveConfig.DebugMode then print("PAT DEBUG: Sampled " .. #mainAirCellsSample .. " starting points from mainCaveCellIndices.") end
+				else
+					if CaveConfig.DebugMode then print("PAT WARN: mainCaveCellIndices was not empty, but no AIR cells found from it. Peculiar.") end
+				end
+			end
+
+			-- If no cells from mainCaveCellIndices, or it wasn't populated, try finding largest component now
+			if #mainAirCellsSample == 0 then
+				if CaveConfig.DebugMode then print("PAT DEBUG: mainCaveCellIndices empty or yielded no samples. Running _findAirComponents_local_p45 for MainCaveAir start.") end
+				-- This 'visited' grid for _findAirComponents needs to be temporary if used here,
+				-- or ensure _findAirComponents can be called without side effects on a main 'visited' grid.
+				-- For simplicity, let's assume _findAirComponents_local_p45 creates its own temporary visited grid.
+				local tempComponents = _findAirComponents_local_p45() 
+				if #tempComponents > 0 and tempComponents[1] and #tempComponents[1] > 0 then
+					if CaveConfig.DebugMode then print("PAT DEBUG: Found " .. #tempComponents[1] .. " cells in largest component for MainCaveAir.") end
+					-- Sample from the largest component found
+					local sampleCount = math.min(CaveConfig.AgentTunnels_NumInitialAgents * 5, #tempComponents[1])
+					for k=1, sampleCount do
+						table.insert(mainAirCellsSample, tempComponents[1][localRandomInt(1, #tempComponents[1])])
+					end
+				else
+					if CaveConfig.DebugMode then print("PAT WARN: _findAirComponents_local_p45 found no components for MainCaveAir.") end
+				end
+			end
+
+			if #mainAirCellsSample > 0 then
+				startPosGrid = mainAirCellsSample[localRandomInt(1, #mainAirCellsSample)]
+				-- To ensure we use different cells from the sample for different agents if possible
+				table.remove(mainAirCellsSample, localRandomInt(1, #mainAirCellsSample)) 
+			else
+				if CaveConfig.DebugMode then print("PAT WARN: No MainCaveAir cells found via any method. Falling back to random grid point.") end
+				-- Fallback handled by the general fallback below
+			end 
+
+		elseif CaveConfig.AgentTunnels_StartPolicy == "SpecificSeeds" and CaveConfig.AgentTunnels_SeedPoints[i] then
+			startPosGrid = CaveConfig.AgentTunnels_SeedPoints[i] 
+			if not grid:isInBounds(startPosGrid.x, startPosGrid.y, startPosGrid.z) then
+				if CaveConfig.DebugMode then warn("Phase_AgentTunnels WARN: SpecificSeed point OOB: ", startPosGrid, ". Falling back.") end
+				startPosGrid = nil 
+			end
+		end
+
+		if not startPosGrid then
+			startPosGrid = { 
+				x=localRandomInt(math.floor(gridSizeX*0.25), math.floor(gridSizeX*0.75)),
+				y=localRandomInt(math.floor(gridSizeY*0.25), math.floor(gridSizeY*0.75)),
+				z=localRandomInt(math.floor(gridSizeZ*0.25), math.floor(gridSizeZ*0.75))
+			}
+			if CaveConfig.DebugMode and CaveConfig.AgentTunnels_StartPolicy ~= "RandomAirInGrid" then 
+				print("Phase_AgentTunnels DEBUG: Agent " .. (nextAgentId) .. " (initial) using general fallback start point for policy: "..tostring(CaveConfig.AgentTunnels_StartPolicy))
+			end
+		end
+
+		if startPosGrid then 
+			agentsSpawnedTotal = agentsSpawnedTotal + 1
+			table.insert(activeAgents, {
+				id = nextAgentId,
+				pos = Vector3.new(startPosGrid.x - 0.5, startPosGrid.y - 0.5, startPosGrid.z - 0.5), 
+				dir = AXIAL_DIRECTIONS[localRandomInt(1, #AXIAL_DIRECTIONS)].Unit, 
+				lifetime = localRandomInt(CaveConfig.AgentTunnels_AgentLifetime_MinMax.min, CaveConfig.AgentTunnels_AgentLifetime_MinMax.max),
+				stuckCounter = 0,
+				radius = localRandomInt(CaveConfig.AgentTunnels_TunnelRadius_MinMax.min, CaveConfig.AgentTunnels_TunnelRadius_MinMax.max)
+			})
+			nextAgentId = nextAgentId + 1
+		else
+			if CaveConfig.DebugMode then warn("Phase_AgentTunnels CRITICAL WARN: Failed to determine startPosGrid for an initial agent.") end
+		end
+	end
+
+
+	if #activeAgents == 0 then
+		print("Phase_AgentTunnels INFO: No initial agents could be spawned. Aborting phase.")
+		return
+	end
+	if CaveConfig.DebugMode then print("Phase_AgentTunnels DEBUG: Initialized " .. #activeAgents .. " agents.") end
+
+	local currentLoopIteration = 0
+	while #activeAgents > 0 and totalAgentMovementSteps < CaveConfig.AgentTunnels_MaxTotalAgentSteps do
+		currentLoopIteration = currentLoopIteration + 1
+		local nextGenerationAgents = {}
+		local newBranchedAgentsThisStep = {}
+
+		-- ========= TIMEOUT FIX: Reset counter for this main iteration Start =========
+		agentProcessingCounter = 0 
+		-- ========= TIMEOUT FIX: Reset counter for this main iteration End ===========
+
+		for i_agent, agent in ipairs(activeAgents) do
+			-- ========= TIMEOUT FIX: Increment and Check Start =========
+			agentProcessingCounter = agentProcessingCounter + 1
+			if agentProcessingCounter >= YIELD_AGENT_BATCH_SIZE then
+				doYield() -- This calls your existing global doYield() function
+				agentProcessingCounter = 0 -- Reset after yielding
+			end
+			-- ========= TIMEOUT FIX: Increment and Check End ===========
+
+			local wasAlive = agent.lifetime > 0 -- Check status *before* decrementing for cleaner logging
+			agent.lifetime = agent.lifetime - 1
+
+			if agent.lifetime <= 0 then
+				if wasAlive and CaveConfig.DebugMode then -- Only print if it *just now* died of old age
+					-- To reduce log spam from "died of old age" during heavy testing, 
+					-- you might increase the chance threshold or remove localRandomChance for this specific print.
+					if localRandomChance(0.05) then -- Reduced chance to print this specific message
+						print("Phase_AgentTunnels DEBUG: Agent " .. agent.id .. " DIED OF OLD AGE.") 
+					end
+				end
+				continue 
+			end
+
+			-- 1. Carve at current position (use rounded grid coordinates)
+			local gridX, gridY, gridZ = math.round(agent.pos.X), math.round(agent.pos.Y), math.round(agent.pos.Z)
+			_carveSphereAgentTunnels(grid, gridX, gridY, gridZ, agent.radius, AIR)
+
+			-- 2. Turning Logic (This is the block for non-axial from my previous message)
+			local newDir = agent.dir 
+			if CaveConfig.AgentTunnels_UseNonAxialMovement then 
+				-- [[ ... YOUR NON-AXIAL TURNING LOGIC (the big block from previous message) ... ]]
+				-- ... (example part of it)
+				if localRandomChance(CaveConfig.AgentTunnels_TurnChance) then
+					local turnAxis = Vector3.new(localRandomFloat(-1,1), localRandomFloat(-1,1), localRandomFloat(-1,1))
+					if turnAxis.Magnitude < 1e-4 then turnAxis = Vector3.new(0,1,0) end 
+					turnAxis = turnAxis.Unit
+					local turnAngleDegrees = localRandomFloat(CaveConfig.AgentTunnels_TurnAngle_MinMax_Degrees.min, CaveConfig.AgentTunnels_TurnAngle_MinMax_Degrees.max)
+					local turnAngleRadians = math.rad(turnAngleDegrees)
+
+					if CaveConfig.AgentTunnels_CurlNoise_Enabled and localRandomChance(CaveConfig.AgentTunnels_CurlNoise_Influence) then
+						local worldPosForCurl = cellToWorld(Vector3.new(gridX, gridY, gridZ), origin, cellSize)
+						local curlVec = Perlin.CurlNoise(
+							worldPosForCurl.X / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							worldPosForCurl.Y / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							worldPosForCurl.Z / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							CaveConfig.AgentTunnels_CurlNoise_FrequencyFactor, nil,
+							CaveConfig.AgentTunnels_CurlNoise_Octaves,
+							CaveConfig.AgentTunnels_CurlNoise_Persistence,
+							CaveConfig.AgentTunnels_CurlNoise_Lacunarity
+						)
+						if curlVec.Magnitude > 1e-4 then
+							local rotationAxis = agent.dir:Cross(curlVec).Unit
+							if rotationAxis.Magnitude > 1e-4 then 
+								local angleToCurl = math.acos(math.clamp(agent.dir:Dot(curlVec.Unit), -1, 1))
+								local strengthCorrectedTurnAngle = math.min(angleToCurl, math.rad(CaveConfig.AgentTunnels_CurlNoise_TurnStrength_Degrees))
+								newDir = rotateVectorAroundAxis(agent.dir, rotationAxis, strengthCorrectedTurnAngle)
+							else
+								if agent.dir:Dot(curlVec.Unit) < -0.5 then 
+									newDir = rotateVectorAroundAxis(agent.dir, turnAxis, turnAngleRadians * 0.5) 
+								end
+							end
+						else
+							newDir = rotateVectorAroundAxis(agent.dir, turnAxis, turnAngleRadians)
+						end
+					else
+						newDir = rotateVectorAroundAxis(agent.dir, turnAxis, turnAngleRadians)
+					end
+				end
+				if CaveConfig.AgentTunnels_PreferFlattening and newDir.Y ~= 0 then 
+					local horizontalDir = Vector3.new(newDir.X, 0, newDir.Z)
+					if horizontalDir.Magnitude > 1e-4 then
+						newDir = newDir:Lerp(horizontalDir.Unit, CaveConfig.AgentTunnels_FlatteningStrength)
+					end
+				end
+				if newDir.Magnitude > 1e-6 then agent.dir = newDir.Unit else agent.dir = agent.dir end
+
+
+			else 
+				-- [[ ... YOUR OLD AXIAL TURNING LOGIC ... ]]
+				if localRandomChance(CaveConfig.AgentTunnels_TurnChance) then
+					local decidedToTurn = false 
+					if CaveConfig.AgentTunnels_CurlNoise_Enabled and localRandomChance(CaveConfig.AgentTunnels_CurlNoise_Influence) then
+						local worldPos = cellToWorld(Vector3.new(gridX, gridY, gridZ), origin, cellSize) 
+						local curlVec = Perlin.CurlNoise(
+							worldPos.X / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							worldPos.Y / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							worldPos.Z / CaveConfig.AgentTunnels_CurlNoise_WorldScale,
+							CaveConfig.AgentTunnels_CurlNoise_FrequencyFactor, nil,
+							CaveConfig.AgentTunnels_CurlNoise_Octaves,
+							CaveConfig.AgentTunnels_CurlNoise_Persistence,
+							CaveConfig.AgentTunnels_CurlNoise_Lacunarity
+						)
+						if curlVec.Magnitude > 1e-4 then
+							local allMovementChoices = getOrthogonalAxialDirections(agent.dir, CaveConfig.AgentTunnels_AvoidImmediateReverse)
+							table.insert(allMovementChoices, 1, agent.dir) 
+							local chosenDir = selectBestAxialDirection(curlVec, allMovementChoices, AXIAL_DIRECTIONS) 
+							if chosenDir ~= agent.dir then decidedToTurn = true end
+							newDir = chosenDir
+						else
+							local potentialTurnDirs = getOrthogonalAxialDirections(agent.dir, CaveConfig.AgentTunnels_AvoidImmediateReverse)
+							if #potentialTurnDirs > 0 then newDir = potentialTurnDirs[localRandomInt(1, #potentialTurnDirs)]; decidedToTurn = true end
+						end
+					else
+						local potentialTurnDirs = getOrthogonalAxialDirections(agent.dir, CaveConfig.AgentTunnels_AvoidImmediateReverse)
+						if #potentialTurnDirs > 0 then newDir = potentialTurnDirs[localRandomInt(1, #potentialTurnDirs)]; decidedToTurn = true end
+					end
+					if decidedToTurn and CaveConfig.AgentTunnels_AvoidImmediateReverse and newDir == -agent.dir then
+						local potentialTurnDirs = getOrthogonalAxialDirections(agent.dir, true) 
+						if #potentialTurnDirs > 0 then newDir = potentialTurnDirs[localRandomInt(1, #potentialTurnDirs)] end
+					end
+				end
+				agent.dir = newDir 
+			end
+
+			-- 3. Branching Logic
+			-- [[ ... YOUR BRANCHING LOGIC (should be using agent.pos (float) and agent.dir (vector)) ... ]]
+			if #activeAgents + #newBranchedAgentsThisStep < CaveConfig.AgentTunnels_MaxActiveAgents and
+				localRandomChance(CaveConfig.AgentTunnels_BranchChance) then
+
+				local branchDir = agent.dir
+				local randomBranchAxis = Vector3.new(localRandomFloat(-1,1), localRandomFloat(-1,1), localRandomFloat(-1,1)).Unit
+				if randomBranchAxis.Magnitude < 1e-4 then randomBranchAxis = Vector3.new(0,0,1) end
+
+				local branchAngleDegrees = CaveConfig.AgentTunnels_BranchTurnAngle or 90 
+				branchDir = rotateVectorAroundAxis(agent.dir, randomBranchAxis, math.rad(branchAngleDegrees + localRandomFloat(-15,15)))
+
+				agentsSpawnedTotal = agentsSpawnedTotal + 1
+				table.insert(newBranchedAgentsThisStep, {
+					id = nextAgentId,
+					pos = agent.pos, 
+					dir = branchDir.Unit,
+					lifetime = math.floor(agent.lifetime * CaveConfig.AgentTunnels_BranchLifetimeFactor), 
+					stuckCounter = 0,
+					radius = localRandomInt(CaveConfig.AgentTunnels_TunnelRadius_MinMax.min, CaveConfig.AgentTunnels_TunnelRadius_MinMax.max)
+				})
+				nextAgentId = nextAgentId + 1
+				if CaveConfig.DebugMode then print("Phase_AgentTunnels DEBUG: Agent " .. agent.id .. " branched. New agent: " .. (nextAgentId-1)) end
+			end
+
+
+			-- 4. Attempt Move
+			-- [[ ... YOUR NON-AXIAL MOVEMENT AND VALIDATION LOGIC ... ]]
+			local nextPosFloat = agent.pos + agent.dir * CaveConfig.AgentTunnels_StepLength
+
+			local nextGridX, nextGridY, nextGridZ = math.round(nextPosFloat.X), math.round(nextPosFloat.Y), math.round(nextPosFloat.Z)
+			local margin = 2 
+			if nextGridX >= margin and nextGridX <= gridSizeX - (margin-1) and
+				nextGridY >= margin and nextGridY <= gridSizeY - (margin-1) and
+				nextGridZ >= margin and nextGridZ <= gridSizeZ - (margin-1) then 
+
+				agent.pos = nextPosFloat 
+				agent.stuckCounter = 0
+				totalAgentMovementSteps = totalAgentMovementSteps + 1
+				table.insert(nextGenerationAgents, agent)
+			else
+				agent.stuckCounter = agent.stuckCounter + 1
+				if agent.stuckCounter > CaveConfig.AgentTunnels_MaxStuckBeforeDeath then
+					if CaveConfig.DebugMode and localRandomChance(0.1) then print("Phase_AgentTunnels DEBUG: Agent " .. agent.id .. " died from being stuck/OOB at grid", nextGridX, nextGridY, nextGridZ) end
+				else
+					local escapeAxis = Vector3.new(localRandomFloat(-1,1), localRandomFloat(-1,1), localRandomFloat(-1,1)).Unit
+					if escapeAxis.Magnitude < 1e-4 then escapeAxis = Vector3.new(0,1,0) end
+					agent.dir = rotateVectorAroundAxis(agent.dir, escapeAxis, math.rad(localRandomFloat(60, 120)))
+					if agent.dir.Magnitude > 1e-6 then agent.dir = agent.dir.Unit else agent.dir = AXIAL_DIRECTIONS[localRandomInt(1,6)].Unit end
+					table.insert(nextGenerationAgents, agent) 
+				end
+			end
+
+
+		end -- End individual agent processing loop (ipairs(activeAgents))
+
+		-- Add newly branched agents
+		for _, branchedAgent in ipairs(newBranchedAgentsThisStep) do
+			table.insert(nextGenerationAgents, branchedAgent)
+		end
+
+		activeAgents = nextGenerationAgents
+
+		-- The original doYield() for the whole iteration can be kept or removed.
+		-- If YIELD_AGENT_BATCH_SIZE is small (e.g., 1), this outer one is fully redundant.
+		-- If YIELD_AGENT_BATCH_SIZE is larger, this acts as a final yield for the full step.
+		-- Let's comment it out for now to rely on the inner yield.
+		-- doYield() 
+
+		if CaveConfig.DebugMode and currentLoopIteration % 50 == 0 then
+			print(string.format("Phase_AgentTunnels DEBUG: Iter %d, Active Agents: %d, Total Steps: %d/%d",
+				currentLoopIteration, #activeAgents, totalAgentMovementSteps, CaveConfig.AgentTunnels_MaxTotalAgentSteps))
+		end
+	end -- End main simulation loop (while #activeAgents > 0)
+
+	local endTime = os.clock()
+	print(string.format("Phase_AgentTunnels INFO: Finished! %d agents spawned in total. Total movement steps: %d. Time: %.2fs", agentsSpawnedTotal, totalAgentMovementSteps, endTime - startTime))
+end
+
+
 -- =============================================================================
 -- VI. MAIN EXECUTION
 -- =============================================================================
@@ -1526,11 +1976,15 @@ local function RunCaveGeneration()
 	local errorInPhase=false
 
 	local phasesToRun={
-		{name="Phase1_InitialCaveFormation",func=Phase1_InitialCaveFormation,enabled=true}, -- THIS IS THE ONLY P1 CALL NOW
+		{name="Phase1_InitialCaveFormation",func=Phase1_InitialCaveFormation,enabled=true},
 		{name="Phase2_RockFormations",func=Phase2_RockFormations,enabled=CaveConfig.FormationPhaseEnabled},
 		{name="Phase3_Smoothing",func=Phase3_Smoothing,enabled=CaveConfig.SmoothingPhaseEnabled},
+		-- Phase4 & Phase5 run BEFORE AgentTunnels if using "MainCaveAir"
 		{name="Phase4_EnsureConnectivity",func=Phase4_EnsureConnectivity,enabled=CaveConfig.ConnectivityPhaseEnabled},
 		{name="Phase5_FloodFillCleanup",func=Phase5_FloodFillCleanup,enabled=CaveConfig.FloodFillPhaseEnabled},
+		-- NOW AgentTunnels
+		{name="Phase_AgentTunnels", func=Phase_AgentTunnels, enabled=CaveConfig.AgentTunnels_Enabled},
+		-- Then other features
 		{name="Phase6_SurfaceEntrances",func=Phase6_SurfaceEntrances,enabled=CaveConfig.SurfaceEntrancesPhaseEnabled},
 		{name="Phase7_Bridges",func=Phase7_Bridges,enabled=CaveConfig.BridgePhaseEnabled},
 		{name="Phase8_BuildWorld",func=Phase8_BuildWorld,enabled=true}
