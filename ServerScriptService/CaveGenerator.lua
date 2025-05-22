@@ -314,8 +314,7 @@ local function _carveSphereGrid(targetGrid, cX, cY, cZ, radiusCells, materialToS
 end
 
 local function _getOrDefault(configTable, fieldName, defaultValue, expectedTypeArg)
-	local expectedType = expectedTypeArg or typeof(defaultValue) -- Infer expected type from defaultValue if not specified
-
+	local expectedType = expectedTypeArg or typeof(defaultValue) 
 	if configTable and fieldName and configTable[fieldName] ~= nil then
 		if typeof(configTable[fieldName]) == expectedType then
 			return configTable[fieldName]
@@ -325,52 +324,28 @@ local function _getOrDefault(configTable, fieldName, defaultValue, expectedTypeA
 			return defaultValue
 		end
 	else
-		-- Logger:Warn("ConfigAccess", "Config field '%s' is missing. Using default value: %s", 
-		-- 	tostring(fieldName), tostring(defaultValue))
 		return defaultValue
 	end
 end
 
 local function _getMinMaxOrDefault(configTable, fieldName, defaultMin, defaultMax)
-	local minVal = defaultMin
-	local maxVal = defaultMax
-
+	local minVal, maxVal = defaultMin, defaultMax
 	if configTable and fieldName and typeof(configTable[fieldName]) == "table" then
 		local field = configTable[fieldName]
-		local readMin = field.min
-		local readMax = field.max
-
-		if typeof(readMin) == "number" then
-			minVal = readMin
-		else
-			Logger:Warn("ConfigAccess", "Field '%s.min' is missing or not a number (got %s). Using default min: %s", 
-				tostring(fieldName), typeof(readMin), tostring(defaultMin))
-		end
-
-		if typeof(readMax) == "number" then
-			maxVal = readMax
-		else
-			Logger:Warn("ConfigAccess", "Field '%s.max' is missing or not a number (got %s). Using default max: %s", 
-				tostring(fieldName), typeof(readMax), tostring(defaultMax))
-		end
-
+		if typeof(field.min) == "number" then minVal = field.min 
+		else Logger:Warn("ConfigAccess", "Field '%s.min' missing/not number. Using default: %s", tostring(fieldName), tostring(defaultMin)) end
+		if typeof(field.max) == "number" then maxVal = field.max
+		else Logger:Warn("ConfigAccess", "Field '%s.max' missing/not number. Using default: %s", tostring(fieldName), tostring(defaultMax)) end
 		if typeof(minVal) == "number" and typeof(maxVal) == "number" and minVal > maxVal then
-			Logger:Warn("ConfigAccess", "Field '%s': Corrected min (%s) > max (%s) to min (%s), max (%s).", 
-				tostring(fieldName), tostring(minVal), tostring(maxVal), tostring(maxVal), tostring(minVal))
+			Logger:Warn("ConfigAccess", "Field '%s': min (%s) > max (%s). Swapping.",fieldName,tostring(minVal),tostring(maxVal))
 			minVal, maxVal = maxVal, minVal 
 		end
 	else
-		if configTable and fieldName and typeof(configTable[fieldName]) ~= "table" then
-			Logger:Warn("ConfigAccess", "Field '%s' was expected to be a table for MinMax, but got %s. Using default min/max.", 
-				tostring(fieldName), typeof(configTable[fieldName]))
-			-- else (field or configTable itself is nil, handled by using defaults)
-			-- Logger:Warn("ConfigAccess", "Field '%s' (for MinMax) is missing entirely. Using default min/max.", tostring(fieldName))
-		end
+		if configTable and fieldName and typeof(configTable[fieldName])~="table" then Logger:Warn("ConfigAccess", "Field '%s' not table for MinMax. Using defaults.", fieldName)
+		else Logger:Trace("ConfigAccess", "Field '%s' (for MinMax) missing. Using defaults.", fieldName) end
 	end
-	-- Final safety check if defaults themselves were bad or types were wrong
 	if typeof(minVal) ~= "number" then minVal = 0 end
-	if typeof(maxVal) ~= "number" then maxVal = minVal + 1 end -- Ensure max is at least min + 1
-
+	if typeof(maxVal) ~= "number" then maxVal = minVal + 1 end
 	return minVal, maxVal
 end
 
@@ -1189,49 +1164,50 @@ local function Phase_ConnectLoops(skeletonDataReceived)
 	if not skeletonDataReceived or not skeletonDataReceived.branchPaths or #skeletonDataReceived.branchPaths < 2 then
 		Logger:Warn("Phase_ConnectLoops", "Not enough branch paths in skeletonData to attempt loops. Need at least 2. Skipping.")
 		Logger:Info("Phase_ConnectLoops", "Finished (skipped due to insufficient branch paths). Time: %.2fs", os.clock() - startTime)
-		return -- Return here, no need to store in skeletonDataReceived for this phase usually
+		return 
 	end
 
 	local allPrimaryBranchPaths = skeletonDataReceived.branchPaths
-	local numLoopsToAttempt = localRandomInt(1, 2) -- Or get from CaveConfig
+	-- Correctly get the LoopConnector specific part of PathGeneration config
+	local pathGenCfgLoop_raw = (CaveConfig.PathGeneration and CaveConfig.PathGeneration.LoopConnector) or {}
+
+	local numLoopsToAttempt = localRandomInt(1, _getOrDefault(pathGenCfgLoop_raw, "NumLoopsToAttempt", 2, "number")) 
 	local loopsMade = 0
 
-	-- Loop Connection Parameters (Consider moving more to CaveConfig later)
-	local loopConnectionRadiusStuds_MinMax = CaveConfig.LoopConnector_PathPerlin and CaveConfig.LoopConnector_PathPerlin.RadiusStuds_MinMax or {min = 3, max = 6} -- Get from config or default
-	local maxDistanceBetweenEndpointsStuds = CaveConfig.LoopConnector_PathPerlin and CaveConfig.LoopConnector_PathPerlin.MaxDistanceStuds or 80      -- Get from config or default
+	local defaultLoopRadiusMin = 3
+	local defaultLoopRadiusMax = 6
+	local loopRadiusMin, loopRadiusMax = _getMinMaxOrDefault(pathGenCfgLoop_raw, "RadiusStuds_MinMax", defaultLoopRadiusMin, defaultLoopRadiusMax)
+
+	local maxDistStuds = _getOrDefault(pathGenCfgLoop_raw, "MaxDistanceStuds", 80, "number")
+	local minSegLenStudsLoop = _getOrDefault(pathGenCfgLoop_raw, "SegmentBaseLengthStuds", 10, "number")
+
 
 	local availableBranchIndices = {}
 	for i = 1, #allPrimaryBranchPaths do table.insert(availableBranchIndices, i) end
 
-	-- Main loop to attempt creating the desired number of loops
-	for attempt = 1, numLoopsToAttempt * 5 do -- Try more times than needed in case pairs are bad
+	for attempt = 1, numLoopsToAttempt * 5 do 
 		if loopsMade >= numLoopsToAttempt then break end
 		if #availableBranchIndices < 2 then 
 			Logger:Debug("Phase_ConnectLoops", "Not enough unique branches left to form more loops.")
 			break 
 		end
 
-		local proceedWithThisSpecificLoopAttempt = true -- Flag for current pair validity
-
-		-- Select two different random branches
+		local proceedWithThisSpecificLoopAttempt = true 
 		localShuffleTable(availableBranchIndices)
 		local branchIndex1 = availableBranchIndices[1]
 		local branchIndex2 = availableBranchIndices[2]
 		local path1, path2, endPoint1, endPoint2
 
-		-- Validate selected branches and their paths
 		if not (allPrimaryBranchPaths[branchIndex1] and #allPrimaryBranchPaths[branchIndex1] > 0) then
-			Logger:Warn("Phase_ConnectLoops", "Branch path at index %d is invalid or empty for loop attempt %d. Removing from available.", branchIndex1, attempt)
-			table.remove(availableBranchIndices, 1) -- Remove the bad index
+			Logger:Warn("Phase_ConnectLoops", "Branch path at index %d invalid/empty for loop attempt %d. Removing.", branchIndex1, attempt)
+			if #availableBranchIndices >=1 then table.remove(availableBranchIndices, 1) end 
 			proceedWithThisSpecificLoopAttempt = false
 		end
 
 		if proceedWithThisSpecificLoopAttempt then
 			if not (allPrimaryBranchPaths[branchIndex2] and #allPrimaryBranchPaths[branchIndex2] > 0) then
-				Logger:Warn("Phase_ConnectLoops", "Branch path at index %d is invalid or empty for loop attempt %d. Removing from available.", branchIndex2, attempt)
-				-- Find and remove branchIndex2. Since [1] might have been removed, its position might be [1] now if it was originally [2].
-				local actualIndexForB2 = -1
-				for k, v in ipairs(availableBranchIndices) do if v == branchIndex2 then actualIndexForB2 = k; break; end end
+				Logger:Warn("Phase_ConnectLoops", "Branch path at index %d invalid/empty for loop attempt %d. Removing.", branchIndex2, attempt)
+				local actualIndexForB2 = -1; for k,v in ipairs(availableBranchIndices) do if v==branchIndex2 then actualIndexForB2=k; break; end end
 				if actualIndexForB2 > 0 then table.remove(availableBranchIndices, actualIndexForB2) end
 				proceedWithThisSpecificLoopAttempt = false
 			end
@@ -1242,16 +1218,14 @@ local function Phase_ConnectLoops(skeletonDataReceived)
 			path2 = allPrimaryBranchPaths[branchIndex2]
 			endPoint1 = path1[#path1] 
 			endPoint2 = path2[#path2] 
-
 			local distanceStuds = (endPoint1 - endPoint2).Magnitude * cellSize
 
-			Logger:Trace("Phase_ConnectLoops", "Considering loop (Attempt %d) between branch %d (end %s) and branch %d (end %s). Distance: %.1f studs",
-				attempt, branchIndex1, tostring(endPoint1), branchIndex2, tostring(endPoint2), distanceStuds)
+			Logger:Trace("Phase_ConnectLoops", "Considering loop (Attempt %d) B%d to B%d. Dist: %.1f studs",
+				attempt, branchIndex1, branchIndex2, distanceStuds)
 
-			local minSegLengthStuds = (CaveConfig.PathGeneration.LoopConnector and CaveConfig.PathGeneration.LoopConnector.SegmentBaseLengthStuds or 10)
-			if distanceStuds < (minSegLengthStuds * 1.5) or distanceStuds > maxDistanceBetweenEndpointsStuds then
-				Logger:Trace("Phase_ConnectLoops", "Loop Attempt %d: Distance (%.1f studs) not suitable. MinReq: %.1f, MaxAllow: %.1f. Skipping this pair.", 
-					attempt, distanceStuds, minSegLengthStuds * 1.5, maxDistanceBetweenEndpointsStuds)
+			if distanceStuds < (minSegLenStudsLoop * 1.5) or distanceStuds > maxDistStuds then
+				Logger:Trace("Phase_ConnectLoops", "Loop Attempt %d: Dist %.1f not suitable (MinReq: %.1f, MaxAllow: %.1f). Skip.", 
+					attempt, distanceStuds, minSegLenStudsLoop * 1.5, maxDistStuds)
 				proceedWithThisSpecificLoopAttempt = false
 			end
 		end
@@ -1261,79 +1235,66 @@ local function Phase_ConnectLoops(skeletonDataReceived)
 			if loopInitialDir.Magnitude < 0.1 then loopInitialDir = Vector3.new(localRandomFloat(-1,1),0,localRandomFloat(-1,1)).Unit end
 			if loopInitialDir.Magnitude < 0.1 then loopInitialDir = Vector3.new(1,0,0) end
 
-			local loopRadiusStuds = localRandomFloat(loopConnectionRadiusStuds_MinMax.min, loopConnectionRadiusStuds_MinMax.max)
+			local loopRadiusStuds = localRandomFloat(loopRadiusMin, loopRadiusMax)
 			local loopRadiusCells = math.max(1, math.floor(loopRadiusStuds / cellSize))
 
-			local loopPathGenParams = CaveConfig.PathGeneration.LoopConnector
-			local params_valid_for_path = true
+			local LP = { -- LP for Loop Parameters - Defaults, these are overwritten by _getOrDefault using pathGenCfgLoop_raw
+				SegmentBaseLengthStuds = 10, PathPerlin_MaxTurnDeg = 28, PathPerlin_YawNoiseScale = 0.03,
+				PathPerlin_YawStrengthFactor = 0.9, PathPerlin_PitchNoiseScale = 0.035, PathPerlin_PitchStrengthFactor = 0.45,
+				RadiusVarianceNoiseScale = 0.055, RadiusVarianceFactor = 0.15,
+				TurnTendencyNoiseScale = 0.045, TurnTendencyVariance = 0.25,
+				CarveInitialClearanceAtStart = false, InitialClearanceRadiusCells = 0 
+			}
+			LP.SegmentBaseLengthStuds = _getOrDefault(pathGenCfgLoop_raw, "SegmentBaseLengthStuds", LP.SegmentBaseLengthStuds, "number")
+			LP.PathPerlin_MaxTurnDeg = _getOrDefault(pathGenCfgLoop_raw, "PathPerlin_MaxTurnDeg", LP.PathPerlin_MaxTurnDeg, "number")
+			LP.PathPerlin_YawNoiseScale = _getOrDefault(pathGenCfgLoop_raw, "PathPerlin_YawNoiseScale", LP.PathPerlin_YawNoiseScale, "number")
+			LP.PathPerlin_YawStrengthFactor = _getOrDefault(pathGenCfgLoop_raw, "PathPerlin_YawStrengthFactor", LP.PathPerlin_YawStrengthFactor, "number")
+			LP.PathPerlin_PitchNoiseScale = _getOrDefault(pathGenCfgLoop_raw, "PathPerlin_PitchNoiseScale", LP.PathPerlin_PitchNoiseScale, "number")
+			LP.PathPerlin_PitchStrengthFactor = _getOrDefault(pathGenCfgLoop_raw, "PathPerlin_PitchStrengthFactor", LP.PathPerlin_PitchStrengthFactor, "number")
+			LP.RadiusVarianceNoiseScale = _getOrDefault(pathGenCfgLoop_raw, "RadiusVarianceNoiseScale", LP.RadiusVarianceNoiseScale, "number")
+			LP.RadiusVarianceFactor = _getOrDefault(pathGenCfgLoop_raw, "RadiusVarianceFactor", LP.RadiusVarianceFactor, "number")
+			LP.TurnTendencyNoiseScale = _getOrDefault(pathGenCfgLoop_raw, "TurnTendencyNoiseScale", LP.TurnTendencyNoiseScale, "number")
+			LP.TurnTendencyVariance = _getOrDefault(pathGenCfgLoop_raw, "TurnTendencyVariance", LP.TurnTendencyVariance, "number")
+			LP.CarveInitialClearanceAtStart = _getOrDefault(pathGenCfgLoop_raw, "CarveInitialClearanceAtStart", LP.CarveInitialClearanceAtStart, "boolean")
+			LP.InitialClearanceRadiusCells = _getOrDefault(pathGenCfgLoop_raw, "InitialClearanceRadiusCells", LP.InitialClearanceRadiusCells, "number")
 
-			if not loopPathGenParams then
-				Logger:Error("Phase_ConnectLoops", "CRITICAL: CaveConfig.PathGeneration.LoopConnector is missing! Cannot generate loop path for attempt %d.", attempt)
-				params_valid_for_path = false
-			end
+			local loopSegLenCells = LP.SegmentBaseLengthStuds / cellSize
+			local loopLengthStuds = (endPoint1 - endPoint2).Magnitude * cellSize 
+			local loopNumSegments = math.max(3, math.ceil(loopLengthStuds / LP.SegmentBaseLengthStuds)) 
 
-			local segBaseStuds, maxTurnDeg, yawScale, yawStr, pitchScale, pitchStr
-			if params_valid_for_path then
-				segBaseStuds = loopPathGenParams.SegmentBaseLengthStuds
-				maxTurnDeg = loopPathGenParams.PathPerlin_MaxTurnDeg 
-				yawScale = loopPathGenParams.PathPerlin_YawNoiseScale
-				yawStr = loopPathGenParams.PathPerlin_YawStrengthFactor
-				pitchScale = loopPathGenParams.PathPerlin_PitchNoiseScale
-				pitchStr = loopPathGenParams.PathPerlin_PitchStrengthFactor
+			Logger:Debug("Phase_ConnectLoops", "Attempting Loop Path (Loop #%d, Overall Attempt %d): Connect B%d to B%d. R_studs: %.1f, L_studs: %.1f, NumSeg: %d",
+				loopsMade + 1, attempt, branchIndex1, branchIndex2, loopRadiusStuds, loopLengthStuds, loopNumSegments)
 
-				if not (type(segBaseStuds) == "number" and type(maxTurnDeg) == "number" and
-					type(yawScale) == "number" and type(yawStr) == "number" and
-					type(pitchScale) == "number" and type(pitchStr) == "number") then
-					Logger:Error("Phase_ConnectLoops", "CRITICAL: One or more required PathPerlin parameters are missing or not numbers in CaveConfig.PathGeneration.LoopConnector for attempt %d. Skipping.", attempt)
-					params_valid_for_path = false
+			local loopPathPoints = _generateWindingPath_PerlinAdvanced(
+				endPoint1, loopInitialDir, loopNumSegments, loopSegLenCells, loopLengthStuds,
+				LP.PathPerlin_MaxTurnDeg, LP.PathPerlin_YawNoiseScale, LP.PathPerlin_YawStrengthFactor,
+				LP.PathPerlin_PitchNoiseScale, LP.PathPerlin_PitchStrengthFactor,
+				Rng:NextNumber() * 10000 + 400.0 + attempt, 
+				pathGenCfgLoop_raw 
+			)
+
+			if #loopPathPoints >= 2 then 
+				loopPathPoints[#loopPathPoints] = endPoint2 
+				for k = 1, #loopPathPoints - 1 do
+					local p1_lp, p2_lp = loopPathPoints[k], loopPathPoints[k+1]
+					if not p1_lp or not p2_lp then Logger:Warn("ConnectLoops: Nil point in loop path. Skipping segment."); break end
+					_carveCylinderGrid(grid, p1_lp, p2_lp, loopRadiusCells, AIR)
+					if k % 3 == 0 then doYield() end
 				end
-			end
+				loopsMade = loopsMade + 1
+				Logger:Info("Phase_ConnectLoops", "Loop #%d successfully carved connecting branch %d and %d.", loopsMade, branchIndex1, branchIndex2)
 
-			if params_valid_for_path then
-				local loopSegLenCells = segBaseStuds / cellSize
-				local loopLengthStuds = (endPoint1 - endPoint2).Magnitude * cellSize -- Recalculate from original endpoints just in case
-				local loopNumSegments = math.max(3, math.ceil(loopLengthStuds / segBaseStuds)) 
+				local idx1ToRemove = -1; for l,val in ipairs(availableBranchIndices) do if val == branchIndex1 then idx1ToRemove = l; break; end end
+				if idx1ToRemove > 0 then table.remove(availableBranchIndices, idx1ToRemove) end
 
-				Logger:Debug("Phase_ConnectLoops", "Attempting Loop Path (Loop #%d, Overall Attempt %d): Connect branch %d to branch %d. R_studs: %.1f, L_studs: %.1f, NumSeg: %d, SegLenCells: %.1f",
-					loopsMade + 1, attempt, branchIndex1, branchIndex2, loopRadiusStuds, loopLengthStuds, loopNumSegments, loopSegLenCells)
-
-				local loopPathPoints = _generateWindingPath_PerlinAdvanced(
-					endPoint1, loopInitialDir,
-					loopNumSegments, loopSegLenCells,
-					loopLengthStuds,
-					maxTurnDeg,
-					yawScale, yawStr,
-					pitchScale, pitchStr,
-					Rng:NextNumber() * 10000 + 400.0 + attempt, 
-					loopPathGenParams 
-				)
-
-				if #loopPathPoints >= 2 then 
-					loopPathPoints[#loopPathPoints] = endPoint2 -- Refine endpoint for clean connection
-
-					for k = 1, #loopPathPoints - 1 do
-						_carveCylinderGrid(grid, loopPathPoints[k], loopPathPoints[k+1], loopRadiusCells, AIR)
-						if k % 3 == 0 then doYield() end
-					end
-					loopsMade = loopsMade + 1
-					Logger:Info("Phase_ConnectLoops", "Loop #%d successfully carved connecting branch %d and %d.", loopsMade, branchIndex1, branchIndex2)
-
-					-- Remove used branches from consideration (find by value now, as indices shift)
-					local idx1ToRemove = -1; for k,v in ipairs(availableBranchIndices) do if v == branchIndex1 then idx1ToRemove = k; break; end end
-					if idx1ToRemove > 0 then table.remove(availableBranchIndices, idx1ToRemove) end
-
-					local idx2ToRemove = -1; for k,v in ipairs(availableBranchIndices) do if v == branchIndex2 then idx2ToRemove = k; break; end end
-					if idx2ToRemove > 0 then table.remove(availableBranchIndices, idx2ToRemove) end
-				else
-					Logger:Warn("Phase_ConnectLoops", "Loop connector path generation failed (less than 2 points) for attempt %d.", attempt)
-				end
+				local idx2ToRemove = -1; for l,val in ipairs(availableBranchIndices) do if val == branchIndex2 then idx2ToRemove = l; break; end end
+				if idx2ToRemove > 0 then table.remove(availableBranchIndices, idx2ToRemove) end
 			else
-				Logger:Warn("Phase_ConnectLoops", "Skipping loop attempt %d due to missing/invalid config parameters for path generation.", attempt)
+				Logger:Warn("Phase_ConnectLoops", "Loop connector path gen failed (<2 pts) for attempt %d.", attempt)
 			end
-		end -- end of if proceedWithThisSpecificLoopAttempt
+		end 
 		doYield()
-	end -- End of for attempt loop
-
+	end 
 	Logger:Info("Phase_ConnectLoops", "%d Full Loops Made. Finished! Time: %.2fs", loopsMade, os.clock() - startTime)
 end
 
