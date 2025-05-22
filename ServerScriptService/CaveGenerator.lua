@@ -203,6 +203,16 @@ local function doYield()
 	if yieldCounter >= CaveConfig.GlobalYieldBatchSize then RunService.Heartbeat:Wait(); yieldCounter = 0 end
 end -- End doYield
 
+local function _ensureNumber(value, defaultValue, fieldNameForWarning)
+	if type(value) == "number" then
+		return value
+	else
+		Logger:Warn("ConfigValidation", "Expected number for '%s', got %s. Using default: %s", 
+			tostring(fieldNameForWarning), typeof(value), tostring(defaultValue))
+		return defaultValue
+	end
+end
+
 local function cellToWorld(cellPos, currentOrigin, currentCellSize)
 	return Vector3.new(
 		currentOrigin.X + (cellPos.X - 1) * currentCellSize,
@@ -210,6 +220,523 @@ local function cellToWorld(cellPos, currentOrigin, currentCellSize)
 		currentOrigin.Z + (cellPos.Z - 1) * currentCellSize
 	)
 end -- End cellToWorld
+
+local function localRandomFloat(min,max) return min + Rng:NextNumber() * (max - min) end
+local function localRandomInt(min,max) return Rng:NextInteger(min, max) end
+local function rotateVectorAroundAxis(vecToRotate, axis, angleRadians)
+	local rotationCFrame = CFrame.fromAxisAngle(axis.Unit, angleRadians)
+	return (rotationCFrame * vecToRotate)
+end
+
+local function _getSurfaceCellsInfo(targetGrid, targetMaterial, adjacentMaterial)
+	Logger:Debug("Util_Surface", "Starting surface cell identification (Target: %s, Adjacent: %s)", tostring(targetMaterial), tostring(adjacentMaterial))
+	local startTime = os.clock()
+	local surfaceCells = {}
+	local cellsProcessed = 0
+	local surfaceCellsFound = 0
+	local yieldThreshold_surface = CaveConfig.SurfaceScanYieldBatchSize or 10000 -- Make it configurable, default to 10k
+
+	-- Define neighbors to check for a surface. Dirs point from current cell to neighbor.
+	local neighborDirs = {
+		{d={0,1,0}, type="Ceiling"},   -- Current cell is SOLID, neighbor ABOVE is AIR -> current cell is part of a CEILING
+		{d={0,-1,0}, type="Floor"},    -- Current cell is SOLID, neighbor BELOW is AIR -> current cell is part of a FLOOR
+		{d={1,0,0}, type="WallPX"},    -- Current cell is SOLID, neighbor POS_X is AIR -> current cell is part of a WALL (PX face)
+		{d={-1,0,0}, type="WallNX"},   -- Current cell is SOLID, neighbor NEG_X is AIR -> current cell is part of a WALL (NX face)
+		{d={0,0,1}, type="WallPZ"},    -- Current cell is SOLID, neighbor POS_Z is AIR -> current cell is part of a WALL (PZ face)
+		{d={0,0,-1}, type="WallNZ"}    -- Current cell is SOLID, neighbor NEG_Z is AIR -> current cell is part of a WALL (NZ face)
+	}
+
+	for z = 1, targetGrid.size.Z do
+		for y = 1, targetGrid.size.Y do
+			for x = 1, targetGrid.size.X do
+				cellsProcessed = cellsProcessed + 1
+				if targetGrid:get(x,y,z) == targetMaterial then
+					for _, check in ipairs(neighborDirs) do
+						local nx, ny, nz = x + check.d[1], y + check.d[2], z + check.d[3]
+						if targetGrid:isInBounds(nx,ny,nz) and targetGrid:get(nx,ny,nz) == adjacentMaterial then
+							-- This (x,y,z) cell IS a surface cell of targetMaterial,
+							-- with its 'check.type' face exposed to adjacentMaterial.
+							-- The normal points from (x,y,z) towards (nx,ny,nz).
+							table.insert(surfaceCells, {
+								pos = Vector3.new(x,y,z),
+								normal = Vector3.new(check.d[1], check.d[2], check.d[3]), -- Points from SOLID into AIR
+								surfaceType = check.type
+							})
+							surfaceCellsFound = surfaceCellsFound + 1
+							-- A single cell can be part of multiple surfaces (e.g. a corner)
+							-- So we don't 'break' here, we add for each exposed face.
+						end
+					end
+				end
+				if cellsProcessed % yieldThreshold_surface == 0 then 
+					RunService.Heartbeat:Wait() 
+					-- If you want to see yields, uncomment this:
+					-- Logger:Trace("Util_Surface", "Yielding during surface scan. Cells Processed: %d", cellsProcessed)
+				end
+			end
+		end
+		-- Optional: Yield per Z-slice too if grid is very large in XY
+		-- RunService.Heartbeat:Wait() 
+		-- Logger:Trace("Util_Surface", "Finished Z-slice %d for surface scan.", z)
+	end
+	Logger:Info("Util_Surface", "Surface cell identification finished. Cells processed: %d. Surface points found: %d. Time: %.2fs",
+		cellsProcessed, surfaceCellsFound, os.clock() - startTime)
+	return surfaceCells
+end
+
+local function _carveSphereGrid(targetGrid, cX, cY, cZ, radiusCells, materialToSet)
+	-- Ensure cX, cY, cZ are integers for grid coordinates
+	cX = math.round(cX)
+	cY = math.round(cY)
+	cZ = math.round(cZ)
+	radiusCells = math.max(0, math.floor(radiusCells))
+	local cellsChanged = 0
+
+	for dz_s = -radiusCells, radiusCells do
+		for dy_s = -radiusCells, radiusCells do
+			for dx_s = -radiusCells, radiusCells do
+				if dx_s*dx_s + dy_s*dy_s + dz_s*dz_s <= radiusCells*radiusCells + 0.1 then -- Small epsilon for edge cases
+					local nx, ny, nz = cX + dx_s, cY + dy_s, cZ + dz_s
+					if targetGrid:isInBounds(nx, ny, nz) then
+						if targetGrid:get(nx, ny, nz) ~= materialToSet then
+							cellsChanged = cellsChanged + 1
+						end
+						targetGrid:set(nx, ny, nz, materialToSet)
+					end
+				end
+			end
+		end
+	end
+	if cellsChanged > 0 or radiusCells > 0 then -- Log even if no cells changed but we tried to carve
+		Logger:Trace("CarveUtil_Sphere", "Attempted sphere carve at (%d,%d,%d) r:%d. Cells set to %s: %d", cX,cY,cZ,radiusCells,tostring(materialToSet), cellsChanged)
+	end
+	return cellsChanged
+end
+
+local function _getOrDefault(configTable, fieldName, defaultValue, expectedTypeArg)
+	local expectedType = expectedTypeArg or typeof(defaultValue) -- Infer expected type from defaultValue if not specified
+
+	if configTable and fieldName and configTable[fieldName] ~= nil then
+		if typeof(configTable[fieldName]) == expectedType then
+			return configTable[fieldName]
+		else
+			Logger:Warn("ConfigAccess", "Field '%s': Expected type %s, got %s. Using default value: %s", 
+				tostring(fieldName), expectedType, typeof(configTable[fieldName]), tostring(defaultValue))
+			return defaultValue
+		end
+	else
+		-- Logger:Warn("ConfigAccess", "Config field '%s' is missing. Using default value: %s", 
+		-- 	tostring(fieldName), tostring(defaultValue))
+		return defaultValue
+	end
+end
+
+local function _getMinMaxOrDefault(configTable, fieldName, defaultMin, defaultMax)
+	local minVal = defaultMin
+	local maxVal = defaultMax
+
+	if configTable and fieldName and typeof(configTable[fieldName]) == "table" then
+		local field = configTable[fieldName]
+		local readMin = field.min
+		local readMax = field.max
+
+		if typeof(readMin) == "number" then
+			minVal = readMin
+		else
+			Logger:Warn("ConfigAccess", "Field '%s.min' is missing or not a number (got %s). Using default min: %s", 
+				tostring(fieldName), typeof(readMin), tostring(defaultMin))
+		end
+
+		if typeof(readMax) == "number" then
+			maxVal = readMax
+		else
+			Logger:Warn("ConfigAccess", "Field '%s.max' is missing or not a number (got %s). Using default max: %s", 
+				tostring(fieldName), typeof(readMax), tostring(defaultMax))
+		end
+
+		if typeof(minVal) == "number" and typeof(maxVal) == "number" and minVal > maxVal then
+			Logger:Warn("ConfigAccess", "Field '%s': Corrected min (%s) > max (%s) to min (%s), max (%s).", 
+				tostring(fieldName), tostring(minVal), tostring(maxVal), tostring(maxVal), tostring(minVal))
+			minVal, maxVal = maxVal, minVal 
+		end
+	else
+		if configTable and fieldName and typeof(configTable[fieldName]) ~= "table" then
+			Logger:Warn("ConfigAccess", "Field '%s' was expected to be a table for MinMax, but got %s. Using default min/max.", 
+				tostring(fieldName), typeof(configTable[fieldName]))
+			-- else (field or configTable itself is nil, handled by using defaults)
+			-- Logger:Warn("ConfigAccess", "Field '%s' (for MinMax) is missing entirely. Using default min/max.", tostring(fieldName))
+		end
+	end
+	-- Final safety check if defaults themselves were bad or types were wrong
+	if typeof(minVal) ~= "number" then minVal = 0 end
+	if typeof(maxVal) ~= "number" then maxVal = minVal + 1 end -- Ensure max is at least min + 1
+
+	return minVal, maxVal
+end
+
+local function _generateWindingPath(startPosGrid, initialDirVec3, numSegments, segmentLengthCells, maxTurnAngleDegrees, overallLengthStuds)
+	local pathPoints = {startPosGrid}
+	local currentPos = Vector3.new(startPosGrid.X, startPosGrid.Y, startPosGrid.Z) 
+	local currentDir = initialDirVec3.Unit
+	local totalPathLengthCells = 0
+	local targetTotalLengthCells = overallLengthStuds / cellSize 
+
+	local upVector = Vector3.new(0, 1, 0)
+	if math.abs(currentDir:Dot(upVector)) > 0.9 then 
+		upVector = Vector3.new(1, 0, 0) 
+	end
+
+	for i = 1, numSegments do
+		if totalPathLengthCells >= targetTotalLengthCells then
+			break
+		end
+
+		local turnAngleRad = math.rad(localRandomFloat(-maxTurnAngleDegrees, maxTurnAngleDegrees))
+		local randomRotationAxis = currentDir:Cross(Vector3.new(localRandomFloat(-1,1),localRandomFloat(-1,1),localRandomFloat(-1,1))).Unit
+		if randomRotationAxis.Magnitude < 0.1 then 
+			randomRotationAxis = currentDir:Cross(upVector).Unit
+			if randomRotationAxis.Magnitude < 0.1 then 
+				randomRotationAxis = Vector3.new(0,0,1):Cross(currentDir).Unit
+				if randomRotationAxis.Magnitude < 0.1 then  randomRotationAxis = Vector3.new(0,1,0) end 
+			end
+		end
+
+		currentDir = rotateVectorAroundAxis(currentDir, randomRotationAxis, turnAngleRad) -- ASSUMES rotateVectorAroundAxis IS DEFINED AND ACCESSIBLE
+		currentDir = currentDir.Unit 
+
+		local nextPos = currentPos + currentDir * segmentLengthCells
+		table.insert(pathPoints, nextPos)
+		currentPos = nextPos
+		totalPathLengthCells = totalPathLengthCells + segmentLengthCells
+
+		doYield() 
+	end
+	return pathPoints
+end
+
+local function _generateWindingPath_Perlin(
+	startPosGridVec3, initialDirVec3, 
+	numSegmentsToTry, segmentLengthCells, 
+	overallTargetLengthStuds, 
+	maxTurnAngleDeg, 
+	yawNoiseScale, yawStrengthFactor, 
+	pitchNoiseScale, pitchStrengthFactor, 
+	uniqueNoiseSeedOffset -- A unique number for this specific path
+)
+
+	local pathPoints = {Vector3.new(startPosGridVec3.X, startPosGridVec3.Y, startPosGridVec3.Z)}
+	local currentPos = pathPoints[1]
+	local currentDir = initialDirVec3.Unit
+	local targetTotalLengthCells = overallTargetLengthStuds / cellSize -- cellSize needs to be accessible
+	local actualPathLengthCells = 0
+
+	local worldUp = Vector3.new(0, 1, 0)
+	if math.abs(currentDir:Dot(worldUp)) > 0.98 then
+		worldUp = Vector3.new(1, 0, 0) 
+	end
+
+	for i = 1, numSegmentsToTry do
+		if actualPathLengthCells >= targetTotalLengthCells and overallTargetLengthStuds > 0 then -- Check if overallTargetLengthStuds > 0
+			-- Logger:Trace("_generateWindingPath_Perlin", "Path ID %.2f: Target length reached.", uniqueNoiseSeedOffset)
+			break
+		end
+
+		local localRight = currentDir:Cross(worldUp).Unit
+		-- If currentDir and worldUp are parallel (e.g. straight up/down), localRight will be zero.
+		if localRight.Magnitude < 0.1 then 
+			-- Try a different 'worldUp' for this segment if gimbal lock occurs
+			local tempWorldRight = Vector3.new(1,0,0)
+			if math.abs(currentDir:Dot(tempWorldRight)) > 0.98 then tempWorldRight = Vector3.new(0,0,1) end
+			localRight = currentDir:Cross(tempWorldRight).Unit
+		end
+		local localUp = localRight:Cross(currentDir).Unit
+
+		local yawNoiseInput = actualPathLengthCells * yawNoiseScale + uniqueNoiseSeedOffset
+		local pitchNoiseInput = actualPathLengthCells * pitchNoiseScale + uniqueNoiseSeedOffset + 50.0 -- Offset to decorrelate
+
+		local yawNoiseValue = (Perlin.Noise(yawNoiseInput, uniqueNoiseSeedOffset + 10.1, uniqueNoiseSeedOffset + 20.2) * 2) - 1
+		local pitchNoiseValue = (Perlin.Noise(uniqueNoiseSeedOffset + 30.3, pitchNoiseInput, uniqueNoiseSeedOffset + 40.4) * 2) - 1
+
+		local yawTurnAngle = yawNoiseValue * math.rad(maxTurnAngleDeg * yawStrengthFactor)
+		local pitchTurnAngle = pitchNoiseValue * math.rad(maxTurnAngleDeg * pitchStrengthFactor)
+
+		local tempDir = currentDir
+		tempDir = rotateVectorAroundAxis(tempDir, localUp, yawTurnAngle)
+		tempDir = rotateVectorAroundAxis(tempDir, localRight, pitchTurnAngle)
+
+		currentDir = tempDir.Unit
+
+		local nextPos = currentPos + currentDir * segmentLengthCells
+		table.insert(pathPoints, nextPos)
+		currentPos = nextPos
+		actualPathLengthCells = actualPathLengthCells + segmentLengthCells
+
+		doYield() 
+	end
+
+	-- Logger:Trace("_generateWindingPath_Perlin", "Path generated. ID %.2f. Points: %d, TargetSegs: %d, ActualLengthCells: %.1f",
+	--    uniqueNoiseSeedOffset, #pathPoints, numSegmentsToTry, actualPathLengthCells)
+
+	return pathPoints
+end
+
+local function _generateWindingPath_PerlinAdvanced(
+	startPosGridVec3, initialDirVec3, 
+	numSegmentsToTry, baseSegmentLengthCells, overallTargetLengthStuds, 
+	baseMaxTurnDeg, 
+	yawNoiseScale, baseYawStrengthFactor, 
+	pitchNoiseScale, basePitchStrengthFactor, 
+	pathNoiseSeedOffset, 
+	pathParamsConfig -- This will be e.g., Config.PathGeneration.Trunk, .Branch, etc.
+)
+
+	local pathPointsData = {{pos = Vector3.new(startPosGridVec3.X, startPosGridVec3.Y, startPosGridVec3.Z), radiusCells = 0}} 
+	local currentPos = pathPointsData[1].pos
+	local currentDir = initialDirVec3.Unit
+	local targetTotalLengthCells = overallTargetLengthStuds / cellSize
+	local actualPathLengthCells = 0
+
+	local worldUp = Vector3.new(0, 1, 0)
+	if math.abs(currentDir:Dot(worldUp)) > 0.98 then
+		worldUp = Vector3.new(1, 0, 0) 
+	end
+
+	local obstacleCfg = CaveConfig.PathGeneration.ObstacleAvoidance or {} 
+	local enableObstacleAvoidance = false -- Keep this true to use the avoidance logic
+
+	-- Helper for more intelligent steering
+	local function _getBestSteerDirection(current_Pos_steer, proposed_Dir_steer, originalPerlinProposed_Dir_steer, lookAheadDistInCells_steer, segmentLen_steer, seedOffset_steer, localUp_steer, localRight_steer)
+		local steerAngleRad_steer = math.rad(obstacleCfg.SteerAngleDeg or 45) -- Use tuned value
+
+		local probeConfigs = {
+			{vector = originalPerlinProposed_Dir_steer, bias = 0.00, debugName = "OriginalPerlin"},
+			{vector = rotateVectorAroundAxis(originalPerlinProposed_Dir_steer, localUp_steer, steerAngleRad_steer * 0.5), bias = 0.05, debugName = "GentleYawR"}, -- Softer initial steers
+			{vector = rotateVectorAroundAxis(originalPerlinProposed_Dir_steer, localUp_steer, -steerAngleRad_steer * 0.5), bias = 0.05, debugName = "GentleYawL"},
+			{vector = rotateVectorAroundAxis(originalPerlinProposed_Dir_steer, localRight_steer, steerAngleRad_steer * 0.3), bias = 0.07, debugName = "GentlePitchU"},
+			{vector = rotateVectorAroundAxis(originalPerlinProposed_Dir_steer, localRight_steer, -steerAngleRad_steer * 0.3), bias = 0.07, debugName = "GentlePitchD"},
+
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localUp_steer, steerAngleRad_steer), bias = 0.2, debugName = "StdYawR"},
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localUp_steer, -steerAngleRad_steer), bias = 0.2, debugName = "StdYawL"},
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localRight_steer, steerAngleRad_steer * 0.7), bias = 0.25, debugName = "StdPitchU"},
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localRight_steer, -steerAngleRad_steer * 0.7), bias = 0.25, debugName = "StdPitchD"},
+
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localUp_steer, steerAngleRad_steer * 2.0), bias = 0.5, debugName = "HardYawR"}, 
+			{vector = rotateVectorAroundAxis(proposed_Dir_steer, localUp_steer, -steerAngleRad_steer * 2.0), bias = 0.5, debugName = "HardYawL"},
+			{vector = localUp_steer, bias = 0.7, debugName = "TryUpLocalAbs"}, -- More drastic escapes
+			{vector = -localUp_steer, bias = 0.7, debugName = "TryDownLocalAbs"},
+		}
+
+		local bestDir_steer = nil
+		local minScore_steer = math.huge
+		local chosenDebugName = "None"
+
+		for _, probeData in ipairs(probeConfigs) do
+			local testDir = probeData.vector.Unit
+			-- lookAheadDistInCells_steer IS ALREADY the calculated distance in cells
+			local lookAheadP = current_Pos_steer + testDir * lookAheadDistInCells_steer 
+			local lX, lY, lZ = math.round(lookAheadP.X), math.round(lookAheadP.Y), math.round(lookAheadP.Z)
+
+			local score = 0
+			if not grid:isInBounds(lX, lY, lZ) then
+				score = 100 
+			elseif grid:get(lX, lY, lZ) == SOLID then
+				score = 10  
+			end
+
+			score = score + probeData.bias 
+			score = score + Rng:NextNumber() * 0.01 
+
+			if score < minScore_steer then
+				minScore_steer = score
+				bestDir_steer = testDir
+				chosenDebugName = probeData.debugName
+			end
+		end
+
+		if bestDir_steer and minScore_steer < 9.9 then -- Found a direction that isn't definitely SOLID or heavily OOB (allow slightly into solid for tie-breaking)
+			Logger:Trace("_generatePathAdv_SteerChoice", "Path ID %.1f: Chose steer dir %s (type: %s, score %.2f)", seedOffset_steer, tostring(bestDir_steer), chosenDebugName, minScore_steer)
+			return bestDir_steer
+		else
+			Logger:Warn("_generatePathAdv_SteerChoice", "Path ID %.1f: No sufficiently clear steer direction found (best score %.2f was for %s). Original Perlin-proposed: %s", seedOffset_steer, minScore_steer, chosenDebugName, tostring(originalPerlinProposed_Dir_steer))
+			return nil 
+		end
+	end
+
+	local wasInitialClearanceCarved = (pathParamsConfig and pathParamsConfig.CarveInitialClearanceAtStart and (pathParamsConfig.InitialClearanceRadiusCells or 0) > 0)
+	local initialClearanceRadiusValue = (pathParamsConfig and pathParamsConfig.InitialClearanceRadiusCells or 0)
+
+	for i = 1, numSegmentsToTry do
+		if actualPathLengthCells >= targetTotalLengthCells and overallTargetLengthStuds > 0 then
+			break
+		end
+
+		local localRight = currentDir:Cross(worldUp).Unit
+		if localRight.Magnitude < 0.1 then 
+			local altWorldUp = Vector3.new(1,0,0)
+			if math.abs(currentDir:Dot(altWorldUp)) > 0.98 then altWorldUp = Vector3.new(0,0,1) end
+			localRight = currentDir:Cross(altWorldUp).Unit
+			if localRight.Magnitude < 0.1 then 
+				localRight = Vector3.new(-currentDir.Y, currentDir.X, 0).Unit -- Another failsafe if Z is dominant
+				if localRight.Magnitude < 0.1 then localRight = Vector3.new(0, -currentDir.Z, currentDir.Y).Unit end
+				if localRight.Magnitude < 0.1 then localRight = Vector3.new(1,0,0) end -- Absolute fallback
+			end
+		end
+		local localUp = localRight:Cross(currentDir).Unit
+
+		local modulationInput = actualPathLengthCells * (pathParamsConfig.TurnTendencyNoiseScale or 0.05) + pathNoiseSeedOffset
+		local turnTendencyNoise = (Perlin.Noise(modulationInput, pathNoiseSeedOffset + 100, pathNoiseSeedOffset + 110) * 2) - 1
+		local currentMaxTurnDeg = baseMaxTurnDeg * (1 + turnTendencyNoise * (pathParamsConfig.TurnTendencyVariance or 0.3))
+		currentMaxTurnDeg = math.max(5, currentMaxTurnDeg) 
+
+		local currentYawStrength = baseYawStrengthFactor 
+		local currentPitchStrength = basePitchStrengthFactor 
+
+		local yawNoiseInput = actualPathLengthCells * yawNoiseScale + pathNoiseSeedOffset
+		local pitchNoiseInput = actualPathLengthCells * pitchNoiseScale + pathNoiseSeedOffset + 50.0
+		local yawNoiseValue = (Perlin.Noise(yawNoiseInput, pathNoiseSeedOffset + 10.1, pathNoiseSeedOffset + 20.2) * 2) - 1
+		local pitchNoiseValue = (Perlin.Noise(pathNoiseSeedOffset + 30.3, pitchNoiseInput, pathNoiseSeedOffset + 40.4) * 2) - 1
+		local yawTurnAngle = yawNoiseValue * math.rad(currentMaxTurnDeg * currentYawStrength)
+		local pitchTurnAngle = pitchNoiseValue * math.rad(currentMaxTurnDeg * currentPitchStrength)
+
+		local perlinProposedDir = currentDir
+		perlinProposedDir = rotateVectorAroundAxis(perlinProposedDir, localUp, yawTurnAngle)
+		perlinProposedDir = rotateVectorAroundAxis(perlinProposedDir, localRight, pitchTurnAngle)
+		perlinProposedDir = perlinProposedDir.Unit
+
+		local finalDirForSegment = perlinProposedDir
+
+		if enableObstacleAvoidance then
+			local lookAheadDistInCells = (obstacleCfg.LookAheadDistanceCells or 1) * baseSegmentLengthCells
+			lookAheadDistInCells = math.max(1, lookAheadDistInCells) 
+
+			for attempt = 0, (obstacleCfg.MaxSteerAttempts or 3) do 
+				local dirToTest = (attempt == 0) and perlinProposedDir or finalDirForSegment 
+
+				local lookAheadPos = currentPos + dirToTest * lookAheadDistInCells
+				local lX, lY, lZ = math.round(lookAheadPos.X), math.round(lookAheadPos.Y), math.round(lookAheadPos.Z)
+
+				local isObstructed = false
+				if not grid:isInBounds(lX, lY, lZ) then
+					isObstructed = true
+					if attempt == 0 then Logger:Trace("_generatePathAdv_Obstacle", "Path ID %.1f (Seg %d): Perlin dir %s leads OOB at %s", pathNoiseSeedOffset, i, tostring(dirToTest),tostring(Vector3.new(lX,lY,lZ))) end
+				elseif grid:get(lX, lY, lZ) == SOLID then
+					local N_FORGIVING_SEGMENTS_TRUNK = 3 -- How many segments get this special treatment FOR TRUNK-LIKE (those with clearance)
+					local FORGIVING_RADIUS_EXPANSION_TRUNK = baseSegmentLengthCells 
+					local isWithinForgivingPocket = false
+
+					if wasInitialClearanceCarved and initialClearanceRadiusValue > 0 and i <= N_FORGIVING_SEGMENTS_TRUNK then
+						if (Vector3.new(lX,lY,lZ) - startPosGridVec3).Magnitude <= (initialClearanceRadiusValue + FORGIVING_RADIUS_EXPANSION_TRUNK) then
+							isWithinForgivingPocket = true
+						end
+					end
+
+					if not isWithinForgivingPocket then
+						isObstructed = true
+						local reason = "SOLID"
+						if wasInitialClearanceCarved and i <=N_FORGIVING_SEGMENTS_TRUNK then reason = "SOLID (outside forgiving pocket)" end
+						if attempt == 0 then  Logger:Trace("_generatePathAdv_Obstacle", "Path ID %.1f (Seg %d): Perlin dir %s hits %s at %s", pathNoiseSeedOffset, i, tostring(dirToTest), reason,tostring(Vector3.new(lX,lY,lZ))) end
+					else
+						Logger:Trace("_generatePathAdv_Obstacle", "Path ID %.1f (Seg %d): Perlin dir %s hits SOLID at %s but within forgiving pocket. Allowed.", pathNoiseSeedOffset, i, tostring(dirToTest),tostring(Vector3.new(lX,lY,lZ)))
+					end
+				end
+
+				if not isObstructed then
+					finalDirForSegment = dirToTest 
+					if attempt > 0 then Logger:Debug("_generatePathAdv_Obstacle", "Path ID %.1f (Seg %d): Steer attempt %d successful with dir %s.", pathNoiseSeedOffset,i, attempt, tostring(finalDirForSegment)) end
+					break 
+				end
+
+				if attempt < (obstacleCfg.MaxSteerAttempts or 3) then
+					Logger:Debug("_generatePathAdv_Obstacle", "Path ID %.1f (Seg %d): Obstacle for dir %s. Advanced steer attempt #%d.", pathNoiseSeedOffset, i, tostring(dirToTest), attempt + 1)
+					local steeredDir = _getBestSteerDirection(currentPos, dirToTest, perlinProposedDir, lookAheadDistInCells, baseSegmentLengthCells, pathNoiseSeedOffset, localUp, localRight)
+					if steeredDir then
+						finalDirForSegment = steeredDir
+					else
+						Logger:Warn("_generatePathAdv", "Path ID %.1f (Seg %d): Advanced steer could not find any clear alternative. Terminating path.", pathNoiseSeedOffset, i)
+						finalDirForSegment = nil 
+						break 
+					end
+				else
+					Logger:Warn("_generatePathAdv", "Path ID %.1f (Seg %d): Max steer attempts (%d) reached. Terminating path.", pathNoiseSeedOffset, i, (obstacleCfg.MaxSteerAttempts or 3))
+					finalDirForSegment = nil 
+					break 
+				end
+			end 
+
+			if not finalDirForSegment then 
+				if #pathPointsData > 1 then table.remove(pathPointsData) end 
+				Logger:Warn("_generatePathAdv", "Path ID %.1f terminated after %d segments due to obstacle avoidance failure.", pathNoiseSeedOffset, i-1)
+				return pathPointsData 
+			end
+		end 
+
+		currentDir = finalDirForSegment.Unit
+
+		local nextPos = currentPos + currentDir * baseSegmentLengthCells
+
+		table.insert(pathPointsData, {pos = nextPos, radiusCells = 0}) 
+		currentPos = nextPos
+		actualPathLengthCells = actualPathLengthCells + baseSegmentLengthCells
+
+		doYield() 
+	end
+
+	Logger:Info("_generatePathAdv", "Advanced path generated. ID: %.1f. Points: %d / TargetSegs: %d. ActualLengthCells: %.1f / Target: %.1f",
+		pathNoiseSeedOffset, #pathPointsData, numSegmentsToTry, actualPathLengthCells, targetTotalLengthCells)
+
+	local justPositions = {}
+	for _, data_item in ipairs(pathPointsData) do 
+		table.insert(justPositions, data_item.pos)
+	end
+	return justPositions
+end
+
+-- Add this lerp function if not already present and accessible in your utilities
+local function lerp(a,b,t) return a+t*(b-a) end
+
+local function _carveCylinderGrid(targetGrid, p1, p2, radiusCells, materialToSet)
+	-- p1, p2 are Vector3 of grid coordinates {x,y,z}
+	radiusCells = math.max(0, math.floor(radiusCells))
+	local cellsChangedTotal = 0
+
+	local direction = (p2 - p1)
+	local length = direction.Magnitude
+	if length < 0.5 then -- If very short, just carve a sphere at p1
+		-- Logger:Trace("CarveUtil", "Cylinder too short, carving sphere at p1 for (%s) r:%d", tostring(p1), radiusCells)
+		return _carveSphereGrid(targetGrid, p1.X, p1.Y, p1.Z, radiusCells, materialToSet)
+	end
+
+	local unitDirection = direction.Unit
+	local R_sq = radiusCells * radiusCells
+
+	-- Iterate along the line segment from p1 to p2
+	-- We can do this by stepping along the main axis of the direction vector
+	-- or by iterating a bounding box and checking distance to the line segment.
+	-- For simplicity and to match "overlapping strokes" let's use spheres along the line.
+	-- Step size should be small enough to ensure good overlap, e.g., radiusCells / 2 or 1.
+	local stepSize = math.max(1, radiusCells / 2) -- Or even just 1 for dense fill
+	local numSteps = math.ceil(length / stepSize)
+
+	Logger:Trace("CarveUtil_Cylinder", "Cylinder p1(%s) p2(%s) r:%d. Length:%.2f, UnitDir:%s, StepSize:%.1f, NumSteps:%d",
+		tostring(p1), tostring(p2), radiusCells, length, tostring(unitDirection), stepSize, numSteps)
+
+	for i = 0, numSteps do
+		local t = i / math.max(1, numSteps) -- Normalized distance along segment
+		local currentCenterPoint = p1 + unitDirection * (t * length)
+		Logger:Trace("CarveUtil_Cylinder", "Segment %d/%d at (%.1f,%.1f,%.1f) with radius %d",
+			i, numSteps, currentCenterPoint.X, currentCenterPoint.Y, currentCenterPoint.Z, radiusCells)
+		cellsChangedTotal = cellsChangedTotal + _carveSphereGrid(targetGrid,
+			math.round(currentCenterPoint.X),
+			math.round(currentCenterPoint.Y),
+			math.round(currentCenterPoint.Z),
+			radiusCells,
+			materialToSet
+		)
+		doYield() -- Yield within long carving operations
+	end
+	Logger:Info("CarveUtil_Cylinder", "Finished cylinder. Approx spheres: %d. Total cells changed (sum of sphere changes): %d", numSteps + 1, cellsChangedTotal)
+	return cellsChangedTotal
+end
 
 local function CountCellTypesInGrid(targetGrid)
 	local airCount = 0
@@ -279,8 +806,6 @@ local function localVerticalConnectivityNoise(worldX,worldY,worldZ,noiseScale)
 	return NoiseGeneratorModule:GetValue(worldX * connScale_vcn, worldZ * connScale_vcn, 0) * CaveConfig.P1_VertConn_Strength
 end -- End localVerticalConnectivityNoise
 
-local function localRandomFloat(min,max) return min + Rng:NextNumber() * (max - min) end
-local function localRandomInt(min,max) return Rng:NextInteger(min, max) end
 local function localRandomChance(prob) return Rng:NextNumber() < prob end
 local function localShuffleTable(tbl) 
 	local n_st = #tbl
@@ -297,7 +822,1038 @@ local mainCaveCellIndices = {}
 -- =============================================================================
 -- V. PHASE FUNCTIONS 
 -- =============================================================================
-local function Phase1_InitialCaveFormation()
+
+local function Phase_CarveSkeleton()
+	Logger:Info("Phase_CarveSkeleton", "Starting Skeleton Generation (Trunk, Branches, Spurs)...")
+	local startTime = os.clock()
+
+	local skeletonData = { trunkPath = {}, branchPaths = {}, spurPaths = {} } 
+	local collectedBranchPaths, collectedSpurPaths = {}, {}
+	local validBranchStartIndex, validBranchEndIndex
+	local primaryBranchStartIndices_USED = {}
+	local branchesMade, spursMade = 0, 0
+	local initialTrunkDirection = Vector3.new(1,0,0) 
+
+	-- ==== TRUNK GENERATION ====
+	Logger:Debug("Phase_CarveSkeleton", "Setting up TRUNK parameters...")
+	local pathGenCfg_Trunk_raw = (CaveConfig.PathGeneration and CaveConfig.PathGeneration.Trunk) or {} -- USED _raw
+	local skelCfg_Trunk_raw = CaveConfig.Skeleton_Trunk or {} -- USED _raw
+
+	local TP = { -- TP for Trunk Parameters - DEFINE DEFAULTS
+		StartRadiusStuds = 10, EndRadiusStuds = 14, RadiusVarianceFactor = 0.15, TargetLengthStuds = 200,
+		StartX_Range = {0.15, 0.25}, StartY_Range = {0.45, 0.55}, StartZ_Range = {0.15, 0.25},
+		Count_MinMax = {min = 4, max = 6},
+		SegmentBaseLengthStuds = 12, PathPerlin_MaxTurnDeg = 20, PathPerlin_YawNoiseScale = 0.015,
+		PathPerlin_YawStrengthFactor = 0.9, PathPerlin_PitchNoiseScale = 0.02, PathPerlin_PitchStrengthFactor = 0.3,
+		RadiusVarianceNoiseScale = 0.03, TurnTendencyNoiseScale = 0.02, TurnTendencyVariance = 0.2,
+		CarveInitialClearanceAtStart = true, InitialClearanceRadiusCells = 5
+	}
+	-- Overwrite TP with values from skelCfg_Trunk_raw if they exist and are valid
+	TP.StartRadiusStuds = _ensureNumber(skelCfg_Trunk_raw.StartRadiusStuds, TP.StartRadiusStuds, "skelCfg_Trunk_raw.StartRadiusStuds")
+	TP.EndRadiusStuds = _ensureNumber(skelCfg_Trunk_raw.EndRadiusStuds, TP.EndRadiusStuds, "skelCfg_Trunk_raw.EndRadiusStuds")
+	TP.RadiusVarianceFactor = _ensureNumber(skelCfg_Trunk_raw.RadiusVarianceFactor, TP.RadiusVarianceFactor, "skelCfg_Trunk_raw.RadiusVarianceFactor")
+	TP.TargetLengthStuds = _ensureNumber(skelCfg_Trunk_raw.TargetLengthStuds, TP.TargetLengthStuds, "skelCfg_Trunk_raw.TargetLengthStuds")
+	if typeof(skelCfg_Trunk_raw.StartX_Range) == "table" and #skelCfg_Trunk_raw.StartX_Range == 2 and typeof(skelCfg_Trunk_raw.StartX_Range[1])=="number" and typeof(skelCfg_Trunk_raw.StartX_Range[2])=="number" then TP.StartX_Range = skelCfg_Trunk_raw.StartX_Range else Logger:Warn("CFG: Trunk.StartX_Range invalid, using defaults.") end
+	if typeof(skelCfg_Trunk_raw.StartY_Range) == "table" and #skelCfg_Trunk_raw.StartY_Range == 2 and typeof(skelCfg_Trunk_raw.StartY_Range[1])=="number" and typeof(skelCfg_Trunk_raw.StartY_Range[2])=="number" then TP.StartY_Range = skelCfg_Trunk_raw.StartY_Range else Logger:Warn("CFG: Trunk.StartY_Range invalid, using defaults.") end
+	if typeof(skelCfg_Trunk_raw.StartZ_Range) == "table" and #skelCfg_Trunk_raw.StartZ_Range == 2 and typeof(skelCfg_Trunk_raw.StartZ_Range[1])=="number" and typeof(skelCfg_Trunk_raw.StartZ_Range[2])=="number" then TP.StartZ_Range = skelCfg_Trunk_raw.StartZ_Range else Logger:Warn("CFG: Trunk.StartZ_Range invalid, using defaults.") end
+	TP.Count_MinMax.min, TP.Count_MinMax.max = _getMinMaxOrDefault(skelCfg_Trunk_raw, "Count_MinMax", TP.Count_MinMax.min, TP.Count_MinMax.max)
+
+	TP.SegmentBaseLengthStuds = _ensureNumber(pathGenCfg_Trunk_raw.SegmentBaseLengthStuds, TP.SegmentBaseLengthStuds, "PathGen.Trunk.SegmentBaseLengthStuds")
+	TP.PathPerlin_MaxTurnDeg = _ensureNumber(pathGenCfg_Trunk_raw.PathPerlin_MaxTurnDeg, TP.PathPerlin_MaxTurnDeg, "PathGen.Trunk.PathPerlin_MaxTurnDeg")
+	TP.PathPerlin_YawNoiseScale = _ensureNumber(pathGenCfg_Trunk_raw.PathPerlin_YawNoiseScale, TP.PathPerlin_YawNoiseScale, "PathGen.Trunk.PathPerlin_YawNoiseScale")
+	TP.PathPerlin_YawStrengthFactor = _ensureNumber(pathGenCfg_Trunk_raw.PathPerlin_YawStrengthFactor, TP.PathPerlin_YawStrengthFactor, "PathGen.Trunk.PathPerlin_YawStrengthFactor")
+	TP.PathPerlin_PitchNoiseScale = _ensureNumber(pathGenCfg_Trunk_raw.PathPerlin_PitchNoiseScale, TP.PathPerlin_PitchNoiseScale, "PathGen.Trunk.PathPerlin_PitchNoiseScale")
+	TP.PathPerlin_PitchStrengthFactor = _ensureNumber(pathGenCfg_Trunk_raw.PathPerlin_PitchStrengthFactor, TP.PathPerlin_PitchStrengthFactor, "PathGen.Trunk.PathPerlin_PitchStrengthFactor")
+	TP.RadiusVarianceNoiseScale = _ensureNumber(pathGenCfg_Trunk_raw.RadiusVarianceNoiseScale, TP.RadiusVarianceNoiseScale, "PathGen.Trunk.RadiusVarianceNoiseScale")
+	TP.RadiusVarianceFactor = _ensureNumber(pathGenCfg_Trunk_raw.RadiusVarianceFactor, TP.RadiusVarianceFactor, "PathGen.Trunk.RadiusVarianceFactor")
+	TP.TurnTendencyNoiseScale = _ensureNumber(pathGenCfg_Trunk_raw.TurnTendencyNoiseScale, TP.TurnTendencyNoiseScale, "PathGen.Trunk.TurnTendencyNoiseScale")
+	TP.TurnTendencyVariance = _ensureNumber(pathGenCfg_Trunk_raw.TurnTendencyVariance, TP.TurnTendencyVariance, "PathGen.Trunk.TurnTendencyVariance")
+	TP.CarveInitialClearanceAtStart = _getOrDefault(pathGenCfg_Trunk_raw, "CarveInitialClearanceAtStart", TP.CarveInitialClearanceAtStart, "boolean")
+	TP.InitialClearanceRadiusCells = _ensureNumber(pathGenCfg_Trunk_raw.InitialClearanceRadiusCells, TP.InitialClearanceRadiusCells, "PathGen.Trunk.InitialClearanceRadiusCells")
+
+	local trunkStartRadiusCells = TP.StartRadiusStuds / cellSize
+	local trunkEndRadiusCells = TP.EndRadiusStuds / cellSize
+	local trunkSegmentLengthCells = TP.SegmentBaseLengthStuds / cellSize
+	local trunkNumSegments = math.max(1, math.ceil(TP.TargetLengthStuds / TP.SegmentBaseLengthStuds))
+
+	local startX = localRandomInt(math.floor(gridSizeX * TP.StartX_Range[1]), math.floor(gridSizeX * TP.StartX_Range[2]))
+	local startY = localRandomInt(math.floor(gridSizeY * TP.StartY_Range[1]), math.floor(gridSizeY * TP.StartY_Range[2]))
+	local startZ = localRandomInt(math.floor(gridSizeZ * TP.StartZ_Range[1]), math.floor(gridSizeZ * TP.StartZ_Range[2]))
+	local trunkStartPos = Vector3.new(startX, startY, startZ)
+
+	if TP.CarveInitialClearanceAtStart and TP.InitialClearanceRadiusCells > 0 then
+		Logger:Debug("Phase_CarveSkeleton", "Carving initial TRUNK clearance: %s, R:%d cells", tostring(trunkStartPos), TP.InitialClearanceRadiusCells)
+		_carveSphereGrid(grid, trunkStartPos.X, trunkStartPos.Y, trunkStartPos.Z, TP.InitialClearanceRadiusCells, AIR)
+	end
+
+	local initialTrunkTargetPos = Vector3.new(gridSizeX / 2, gridSizeY / 2, gridSizeZ / 2)
+	local globalTargetInfluence = _getOrDefault(CaveConfig.PathGeneration, "GlobalTargetInfluence", 0.3, "number")
+	local globalTargetNoiseScale = _getOrDefault(CaveConfig.PathGeneration, "GlobalTargetNoiseScale", 0.002, "number")
+	if globalTargetInfluence > 0 then
+		local noisyOffsetMag = gridSizeX * 0.4 
+		local nX = (Perlin.Noise(origin.X*globalTargetNoiseScale+12.3,origin.Y*globalTargetNoiseScale+45.6,origin.Z*globalTargetNoiseScale+78.9) * 2-1) * noisyOffsetMag
+		local nY = (Perlin.Noise(origin.X*globalTargetNoiseScale-12.3,origin.Y*globalTargetNoiseScale-45.6,origin.Z*globalTargetNoiseScale-78.9) * 2-1) * (gridSizeY*0.15) 
+		local nZ = (Perlin.Noise(origin.X*globalTargetNoiseScale+55.5,origin.Y*globalTargetNoiseScale-22.2,origin.Z*globalTargetNoiseScale+88.8) * 2-1) * noisyOffsetMag
+		initialTrunkTargetPos = Vector3.new(gridSizeX/2+nX, gridSizeY/2+nY, gridSizeZ/2+nZ)
+		initialTrunkTargetPos = Vector3.new(gridSizeX/2,gridSizeY/2,gridSizeZ/2):Lerp(initialTrunkTargetPos, globalTargetInfluence)
+	end
+	initialTrunkDirection = (initialTrunkTargetPos - trunkStartPos).Unit
+	if initialTrunkDirection.Magnitude < 0.1 then initialTrunkDirection = Vector3.new(1,0,0) end
+
+	Logger:Debug("Phase_CarveSkeleton", "Generating TRUNK: Start:%s, Dir:%s, Len:%.0f studs, Segs:%d, SegLenC:%.1f",
+		tostring(trunkStartPos),tostring(initialTrunkDirection),TP.TargetLengthStuds,trunkNumSegments,trunkSegmentLengthCells)
+
+	local trunkPathPoints = _generateWindingPath_PerlinAdvanced( -- Calling with TP fields
+		trunkStartPos, initialTrunkDirection, trunkNumSegments, trunkSegmentLengthCells, TP.TargetLengthStuds,
+		TP.PathPerlin_MaxTurnDeg, TP.PathPerlin_YawNoiseScale, TP.PathPerlin_YawStrengthFactor, 
+		TP.PathPerlin_PitchNoiseScale, TP.PathPerlin_PitchStrengthFactor, 
+		Rng:NextNumber()*1e4+100, pathGenCfg_Trunk_raw -- IMPORTANT: Pass pathGenCfg_Trunk_raw (the original config table) for the last argument
+	)
+	skeletonData.trunkPath = trunkPathPoints
+
+	if #trunkPathPoints < 2 then
+		Logger:Warn("Phase_CarveSkeleton", "TRUNK path gen failed (<2 points). Skipping carving.")
+	else
+		Logger:Info("Phase_CarveSkeleton", "TRUNK path %d points. Carving...", #trunkPathPoints)
+		for i=1, #trunkPathPoints-1 do
+			local p1 = trunkPathPoints[i]; local p2 = trunkPathPoints[i+1]; if not p1 or not p2 then Logger:Warn("Phase_CarveSkeleton", "Nil point in TRUNK path at index " .. i); break end
+			local prog= (i-1)/math.max(1,#trunkPathPoints-2)
+			local baseRC = lerp(trunkStartRadiusCells, trunkEndRadiusCells, prog)
+			local variedRC = baseRC * (1+localRandomFloat(-TP.RadiusVarianceFactor, TP.RadiusVarianceFactor))
+			-- Use TP for radius variance noise parameters
+			if TP.RadiusVarianceNoiseScale > 0 and TP.RadiusVarianceFactor > 0 then
+				local lenSoFar_t = prog*trunkNumSegments*trunkSegmentLengthCells 
+				local rNoiseIn_t = lenSoFar_t*TP.RadiusVarianceNoiseScale + (Rng:NextNumber()*100 + 300)
+				local rNoiseVal_t = (Perlin.Noise(rNoiseIn_t,Rng:NextNumber()*10,Rng:NextNumber()*10)*2)-1
+				variedRC = variedRC * (1+rNoiseVal_t*TP.RadiusVarianceFactor)
+			end
+			_carveCylinderGrid(grid, p1, p2, math.max(1, math.floor(variedRC)), AIR)
+			if i%10==0 then doYield() end
+		end
+	end
+	Logger:Info("Phase_CarveSkeleton", "Main Trunk carving finished.")
+
+	validBranchStartIndex = math.max(2, math.floor(#trunkPathPoints * 0.1))
+	validBranchEndIndex = math.min(#trunkPathPoints - 1, math.floor(#trunkPathPoints * 0.9)) 
+
+	-- ==== PRIMARY BRANCH GENERATION ====
+	Logger:Info("Phase_CarveSkeleton", "Starting Primary Branch Generation...")
+	local pathGenCfg_Branch_raw = (CaveConfig.PathGeneration and CaveConfig.PathGeneration.Branch) or {} -- Used _raw
+	local skelCfg_Branch_raw = CaveConfig.Skeleton_Branch or {} -- Used _raw
+
+	if not CaveConfig.PathGeneration or not CaveConfig.PathGeneration.Branch or not CaveConfig.Skeleton_Branch then
+		Logger:Error("Phase_CarveSkeleton_Branch", "CRITICAL: Branch PathGeneration or Skeleton config table missing. Skipping all branches.")
+	else
+		local numBranches_min_cfg, numBranches_max_cfg = _getMinMaxOrDefault(skelCfg_Trunk_raw, "Count_MinMax", 4, 6) -- Using skelCfg_Trunk_raw for consistency
+		local numBranches = localRandomInt(numBranches_min_cfg, numBranches_max_cfg)
+		local trunkPathIndicesForBranches = {}
+
+		if #trunkPathPoints >= 2 and validBranchEndIndex >= validBranchStartIndex then
+			for i_bidx = validBranchStartIndex, validBranchEndIndex do table.insert(trunkPathIndicesForBranches, i_bidx) end
+			localShuffleTable(trunkPathIndicesForBranches)
+		else Logger:Warn("Phase_CarveSkeleton_Branch", "Trunk path too short or invalid range for branches (%d points). No branches from trunk.", #trunkPathPoints) end
+
+		for iter = 1, #trunkPathIndicesForBranches do
+			local trunkPointIndex_branch = trunkPathIndicesForBranches[iter]
+			if branchesMade >= numBranches then break end
+
+			local proceedWithThisBranch = true 
+			if not (trunkPathPoints and trunkPathPoints[trunkPointIndex_branch]) then
+				Logger:Warn("Phase_CarveSkeleton_Branch", "Invalid trunkPointIndex %s for branch attempt %d. Skipping.", tostring(trunkPointIndex_branch), branchesMade+1)
+				proceedWithThisBranch = false
+			end
+
+			if proceedWithThisBranch then
+				local branchStartPoint = trunkPathPoints[trunkPointIndex_branch]
+				local currentTrunkTangentDir 
+				if trunkPointIndex_branch < #trunkPathPoints and trunkPathPoints[trunkPointIndex_branch + 1] then
+					currentTrunkTangentDir = (trunkPathPoints[trunkPointIndex_branch + 1] - branchStartPoint).Unit
+				elseif trunkPointIndex_branch > 1 and trunkPathPoints[trunkPointIndex_branch - 1] then
+					currentTrunkTangentDir = (branchStartPoint - trunkPathPoints[trunkPointIndex_branch - 1]).Unit
+				else
+					currentTrunkTangentDir = initialTrunkDirection 
+				end
+				if currentTrunkTangentDir.Magnitude < 0.1 then currentTrunkTangentDir = Vector3.new(Rng:NextNumber()*2-1,Rng:NextNumber()*2-1,Rng:NextNumber()*2-1).Unit end
+				if currentTrunkTangentDir.Magnitude < 0.1 then currentTrunkTangentDir = Vector3.new(1,0,0) end
+
+				local randomPerpAxis = currentTrunkTangentDir:Cross(Vector3.new(localRandomFloat(-1,1), localRandomFloat(-1,1), localRandomFloat(-1,1))).Unit
+				if randomPerpAxis.Magnitude < 0.1 then 
+					local upVec = Vector3.new(0,1,0); if math.abs(currentTrunkTangentDir:Dot(upVec)) > 0.95 then upVec = Vector3.new(1,0,0) end
+					randomPerpAxis = currentTrunkTangentDir:Cross(upVec).Unit
+					if randomPerpAxis.Magnitude < 0.1 then randomPerpAxis = Vector3.new(0,0,1) end 
+				end
+				local rotationAroundTangent = math.rad(localRandomFloat(0, 360))
+				local branchOutwardBaseDir = rotateVectorAroundAxis(randomPerpAxis, currentTrunkTangentDir, rotationAroundTangent)
+
+				local BP = { -- BRANCH PARAMETERS WITH DEFAULTS
+					SegmentBaseLengthStuds = 9, PathPerlin_MaxTurnDeg = 30, PathPerlin_YawNoiseScale = 0.035,
+					PathPerlin_YawStrengthFactor = 0.95, PathPerlin_PitchNoiseScale = 0.04, PathPerlin_PitchStrengthFactor = 0.5,
+					RadiusVarianceNoiseScale = 0.06, RadiusVarianceFactor = 0.20, TurnTendencyNoiseScale = 0.05, TurnTendencyVariance = 0.35,
+					BranchOutwardMin = 0.4, BranchOutwardMax = 0.8, BranchTangentInfluenceMin = -0.1, BranchTangentInfluenceMax = 0.3,
+					RadiusStudsMin = 4, RadiusStudsMax = 7, LengthStudsMin = 30, LengthStudsMax = 70,
+					CarveInitialClearanceAtStart = false, InitialClearanceRadiusCells = 0
+				}
+				BP.SegmentBaseLengthStuds = _ensureNumber(pathGenCfg_Branch_raw.SegmentBaseLengthStuds, BP.SegmentBaseLengthStuds, "PathGen.Branch.SegLen")
+				BP.PathPerlin_MaxTurnDeg = _ensureNumber(pathGenCfg_Branch_raw.PathPerlin_MaxTurnDeg, BP.PathPerlin_MaxTurnDeg, "PathGen.Branch.MaxTurn")
+				BP.PathPerlin_YawNoiseScale = _ensureNumber(pathGenCfg_Branch_raw.PathPerlin_YawNoiseScale, BP.PathPerlin_YawNoiseScale, "PathGen.Branch.YawScale")
+				BP.PathPerlin_YawStrengthFactor = _ensureNumber(pathGenCfg_Branch_raw.PathPerlin_YawStrengthFactor, BP.PathPerlin_YawStrengthFactor, "PathGen.Branch.YawStr")
+				BP.PathPerlin_PitchNoiseScale = _ensureNumber(pathGenCfg_Branch_raw.PathPerlin_PitchNoiseScale, BP.PathPerlin_PitchNoiseScale, "PathGen.Branch.PitchScale")
+				BP.PathPerlin_PitchStrengthFactor = _ensureNumber(pathGenCfg_Branch_raw.PathPerlin_PitchStrengthFactor, BP.PathPerlin_PitchStrengthFactor, "PathGen.Branch.PitchStr")
+				BP.RadiusVarianceNoiseScale = _ensureNumber(pathGenCfg_Branch_raw.RadiusVarianceNoiseScale, BP.RadiusVarianceNoiseScale, "PathGen.Branch.RadVarScale")
+				BP.RadiusVarianceFactor = _ensureNumber(pathGenCfg_Branch_raw.RadiusVarianceFactor, BP.RadiusVarianceFactor, "PathGen.Branch.RadVarFactor")
+				BP.TurnTendencyNoiseScale = _ensureNumber(pathGenCfg_Branch_raw.TurnTendencyNoiseScale, BP.TurnTendencyNoiseScale, "PathGen.Branch.TurnTendScale")
+				BP.TurnTendencyVariance = _ensureNumber(pathGenCfg_Branch_raw.TurnTendencyVariance, BP.TurnTendencyVariance, "PathGen.Branch.TurnTendVar")
+				BP.BranchOutwardMin, BP.BranchOutwardMax = _getMinMaxOrDefault(pathGenCfg_Branch_raw, "BranchOutwardMinMax", BP.BranchOutwardMin, BP.BranchOutwardMax)
+				BP.BranchTangentInfluenceMin, BP.BranchTangentInfluenceMax = _getMinMaxOrDefault(pathGenCfg_Branch_raw, "BranchTangentInfluenceMinMax", BP.BranchTangentInfluenceMin, BP.BranchTangentInfluenceMax)
+				BP.RadiusStudsMin, BP.RadiusStudsMax = _getMinMaxOrDefault(skelCfg_Branch_raw, "RadiusStuds_MinMax", BP.RadiusStudsMin, BP.RadiusStudsMax)
+				BP.LengthStudsMin, BP.LengthStudsMax = _getMinMaxOrDefault(skelCfg_Branch_raw, "LengthStuds_MinMax", BP.LengthStudsMin, BP.LengthStudsMax)
+				BP.CarveInitialClearanceAtStart = _getOrDefault(pathGenCfg_Branch_raw, "CarveInitialClearanceAtStart", BP.CarveInitialClearanceAtStart, "boolean")
+				BP.InitialClearanceRadiusCells = _ensureNumber(pathGenCfg_Branch_raw.InitialClearanceRadiusCells, BP.InitialClearanceRadiusCells, "PathGen.Branch.InitialClearance")
+
+				local outwardStrength = localRandomFloat(BP.BranchOutwardMin, BP.BranchOutwardMax) 
+				local tangentInfluence = localRandomFloat(BP.BranchTangentInfluenceMin, BP.BranchTangentInfluenceMax)
+				local branchInitialDir = (branchOutwardBaseDir * outwardStrength + currentTrunkTangentDir * tangentInfluence).Unit 
+				if branchInitialDir.Magnitude < 0.1 then branchInitialDir = branchOutwardBaseDir.Unit end
+				if branchInitialDir.Magnitude < 0.1 then branchInitialDir = randomPerpAxis.Unit end
+
+				local branchRadiusStuds = localRandomFloat(BP.RadiusStudsMin, BP.RadiusStudsMax)
+				local branchLengthStuds = localRandomFloat(BP.LengthStudsMin, BP.LengthStudsMax)
+				local branchSegLenCells = BP.SegmentBaseLengthStuds / cellSize
+				local branchNumSegments = math.max(1, math.ceil(branchLengthStuds / BP.SegmentBaseLengthStuds))
+
+				Logger:Debug("Phase_CarveSkeleton_Branch", "Attempt Branch %d (TrunkPt %d): Dir %s, R%.1f, L%.1f, Segs %d",
+					branchesMade+1,trunkPointIndex_branch,tostring(branchInitialDir),branchRadiusStuds,branchLengthStuds,branchNumSegments)
+
+				local branchPathPoints = _generateWindingPath_PerlinAdvanced(
+					branchStartPoint, branchInitialDir, branchNumSegments, branchSegLenCells, branchLengthStuds,
+					BP.PathPerlin_MaxTurnDeg, BP.PathPerlin_YawNoiseScale, BP.PathPerlin_YawStrengthFactor,
+					BP.PathPerlin_PitchNoiseScale, BP.PathPerlin_PitchStrengthFactor, 
+					Rng:NextNumber()*1e4+200+trunkPointIndex_branch, pathGenCfg_Branch_raw 
+				)
+
+				if #branchPathPoints >= 2 then
+					local branchRadiusCells = math.max(1, math.floor(branchRadiusStuds/cellSize))
+					for k=1,#branchPathPoints-1 do
+						local p1b,p2b = branchPathPoints[k], branchPathPoints[k+1]; if not p1b or not p2b then Logger:Warn("Phase_CarveSkeleton_Branch", "Nil point in branch path for branch %d. Skipping segment.", branchesMade+1); break end
+						local currentBranchRC = branchRadiusCells
+						if BP.RadiusVarianceNoiseScale > 0 and BP.RadiusVarianceFactor > 0 then
+							local prog_br=(k-1)/math.max(1,#branchPathPoints-2)
+							local lenSoFar_br = prog_br*branchNumSegments*branchSegLenCells
+							local rNoiseIn_br = lenSoFar_br*BP.RadiusVarianceNoiseScale+(Rng:NextNumber()*100+400+k)
+							local rNoiseVal_br = (Perlin.Noise(rNoiseIn_br,Rng:NextNumber()*10,Rng:NextNumber()*10)*2)-1
+							currentBranchRC = currentBranchRC*(1+rNoiseVal_br*BP.RadiusVarianceFactor)
+							currentBranchRC = math.max(1,math.floor(currentBranchRC))
+						end
+						_carveCylinderGrid(grid,p1b,p2b,currentBranchRC,AIR)
+						if k%5==0 then doYield() end
+					end
+					table.insert(primaryBranchStartIndices_USED, trunkPointIndex_branch)
+					table.insert(collectedBranchPaths, branchPathPoints)
+					branchesMade=branchesMade+1
+					Logger:Info("Phase_CarveSkeleton_Branch", "Branch %d carved.", branchesMade)
+				else 
+					Logger:Warn("Phase_CarveSkeleton_Branch","Branch path gen failed at TrunkPt %d (<2 pts). Branch %d not created.", trunkPointIndex_branch, branchesMade+1) 
+				end
+			end 
+			doYield()
+		end
+	end 
+	skeletonData.branchPaths = collectedBranchPaths
+	Logger:Info("Phase_CarveSkeleton", "%d Primary Branches Made.", branchesMade)
+
+	-- ==== SECONDARY SPUR GENERATION ====
+	Logger:Info("Phase_CarveSkeleton", "Starting Secondary Spur Generation...")
+	local pathCfgSpur = (CaveConfig.PathGeneration and CaveConfig.PathGeneration.Spur) or {}
+	local skelCfgSpur = CaveConfig.Skeleton_Spur or {}
+
+	if not CaveConfig.PathGeneration or not CaveConfig.PathGeneration.Spur or not CaveConfig.Skeleton_Spur then
+		Logger:Error("Phase_CarveSkeleton_Spur", "CRITICAL: Spur PathGeneration or Skeleton config table missing. Skipping spurs.")
+	else
+		local numSpurs_min_cfg, numSpurs_max_cfg = _getMinMaxOrDefault(skelCfgSpur, "Count_MinMax_PerTrunk", 3, 7)
+		local numSpurs = localRandomInt(numSpurs_min_cfg, numSpurs_max_cfg)
+		local availableTrunkPointsIndicesForSpurs = {}
+
+		if #trunkPathPoints >=2 and validBranchEndIndex >= validBranchStartIndex then
+			for i_spidx = validBranchStartIndex, validBranchEndIndex do table.insert(availableTrunkPointsIndicesForSpurs, i_spidx) end
+			localShuffleTable(availableTrunkPointsIndicesForSpurs)
+		else Logger:Warn("Phase_CarveSkeleton_Spur", "Trunk path too short for spurs (%d points). No spurs from trunk.", #trunkPathPoints) end
+
+		local SPUR_MIN_DIST = _getOrDefault(skelCfgSpur, "MinDistFromBranchSegments", 2)
+
+		for iterSpur = 1, #availableTrunkPointsIndicesForSpurs do
+			local candidateTrunkPointIndex_spur = availableTrunkPointsIndicesForSpurs[iterSpur]
+			if spursMade >= numSpurs then break end
+			local proceedWithThisSpur = true
+			if not (trunkPathPoints and trunkPathPoints[candidateTrunkPointIndex_spur]) then
+				Logger:Warn("Phase_CarveSkeleton_Spur", "Invalid trunk point for spur %d. Skipping.", spursMade+1)
+				proceedWithThisSpur = false
+			end
+
+			if proceedWithThisSpur then
+				local isTooClose = false
+				for _, usedIdx in ipairs(primaryBranchStartIndices_USED) do if math.abs(candidateTrunkPointIndex_spur - usedIdx) < SPUR_MIN_DIST then isTooClose=true; break end end
+				if isTooClose then proceedWithThisSpur = false end
+			end
+
+			if proceedWithThisSpur then
+				local spurStartPoint = trunkPathPoints[candidateTrunkPointIndex_spur]
+				local currentTrunkTangentDir_s 
+				if candidateTrunkPointIndex_spur < #trunkPathPoints and trunkPathPoints[candidateTrunkPointIndex_spur+1] then currentTrunkTangentDir_s = (trunkPathPoints[candidateTrunkPointIndex_spur+1] - spurStartPoint).Unit
+				elseif candidateTrunkPointIndex_spur > 1 and trunkPathPoints[candidateTrunkPointIndex_spur-1] then currentTrunkTangentDir_s = (spurStartPoint - trunkPathPoints[candidateTrunkPointIndex_spur-1]).Unit
+				else currentTrunkTangentDir_s = initialTrunkDirection end 
+				if currentTrunkTangentDir_s.Magnitude < 0.1 then currentTrunkTangentDir_s = Vector3.new(1,0,0) end
+
+				local randomPerpAxis_s = currentTrunkTangentDir_s:Cross(Vector3.new(localRandomFloat(-1,1),localRandomFloat(-1,1),localRandomFloat(-1,1))).Unit
+				if randomPerpAxis_s.Magnitude < 0.1 then local up =Vector3.new(0,1,0); if math.abs(currentTrunkTangentDir_s:Dot(up)) > 0.95 then up=Vector3.new(1,0,0) end; randomPerpAxis_s = currentTrunkTangentDir_s:Cross(up).Unit end
+				if randomPerpAxis_s.Magnitude < 0.1 then randomPerpAxis_s = Vector3.new(0,0,1) end
+				local spurOutwardBaseDir = rotateVectorAroundAxis(randomPerpAxis_s, currentTrunkTangentDir_s, math.rad(localRandomFloat(0,360)))
+				local spurInitialDir = (spurOutwardBaseDir + currentTrunkTangentDir_s * localRandomFloat(0.0,0.2) * (Rng:NextNumber()<0.5 and 1 or -1)).Unit
+				if spurInitialDir.Magnitude < 0.1 then spurInitialDir = spurOutwardBaseDir.Unit end
+				if spurInitialDir.Magnitude < 0.1 then spurInitialDir = randomPerpAxis_s.Unit end
+
+				local SP = { -- SP for Spur Parameters
+					SegmentBaseLengthStuds = 7, PathPerlin_MaxTurnDeg = 40, PathPerlin_YawNoiseScale = 0.045,
+					PathPerlin_YawStrengthFactor = 1.0, PathPerlin_PitchNoiseScale = 0.05, PathPerlin_PitchStrengthFactor = 0.6,
+					RadiusVarianceNoiseScale = 0.07, RadiusVarianceFactor = 0.25, TurnTendencyNoiseScale = 0.06, TurnTendencyVariance = 0.4,
+					RadiusStudsMin = 2, RadiusStudsMax = 4, LengthStudsMin = 15, LengthStudsMax = 35,
+					CarveInitialClearanceAtStart = false, InitialClearanceRadiusCells = 0
+				}
+				SP.SegmentBaseLengthStuds = _ensureNumber(pathCfgSpur.SegmentBaseLengthStuds, SP.SegmentBaseLengthStuds, "PathGen.Spur.SegLen")
+				SP.PathPerlin_MaxTurnDeg = _ensureNumber(pathCfgSpur.PathPerlin_MaxTurnDeg, SP.PathPerlin_MaxTurnDeg, "PathGen.Spur.MaxTurn")
+				SP.PathPerlin_YawNoiseScale = _ensureNumber(pathCfgSpur.PathPerlin_YawNoiseScale, SP.PathPerlin_YawNoiseScale, "PathGen.Spur.YawScale")
+				SP.PathPerlin_YawStrengthFactor = _ensureNumber(pathCfgSpur.PathPerlin_YawStrengthFactor, SP.PathPerlin_YawStrengthFactor, "PathGen.Spur.YawStr")
+				SP.PathPerlin_PitchNoiseScale = _ensureNumber(pathCfgSpur.PathPerlin_PitchNoiseScale, SP.PathPerlin_PitchNoiseScale, "PathGen.Spur.PitchScale")
+				SP.PathPerlin_PitchStrengthFactor = _ensureNumber(pathCfgSpur.PathPerlin_PitchStrengthFactor, SP.PathPerlin_PitchStrengthFactor, "PathGen.Spur.PitchStr")
+				SP.RadiusVarianceNoiseScale = _ensureNumber(pathCfgSpur.RadiusVarianceNoiseScale, SP.RadiusVarianceNoiseScale, "PathGen.Spur.RadVarScale")
+				SP.RadiusVarianceFactor = _ensureNumber(pathCfgSpur.RadiusVarianceFactor, SP.RadiusVarianceFactor, "PathGen.Spur.RadVarFactor")
+				SP.TurnTendencyNoiseScale = _ensureNumber(pathCfgSpur.TurnTendencyNoiseScale, SP.TurnTendencyNoiseScale, "PathGen.Spur.TurnTendScale")
+				SP.TurnTendencyVariance = _ensureNumber(pathCfgSpur.TurnTendencyVariance, SP.TurnTendencyVariance, "PathGen.Spur.TurnTendVar")
+				SP.RadiusStudsMin, SP.RadiusStudsMax = _getMinMaxOrDefault(skelCfgSpur, "RadiusStuds_MinMax", SP.RadiusStudsMin, SP.RadiusStudsMax)
+				SP.LengthStudsMin, SP.LengthStudsMax = _getMinMaxOrDefault(skelCfgSpur, "LengthStuds_MinMax", SP.LengthStudsMin, SP.LengthStudsMax)
+				SP.CarveInitialClearanceAtStart = _getOrDefault(pathCfgSpur, "CarveInitialClearanceAtStart", SP.CarveInitialClearanceAtStart, "boolean")
+				SP.InitialClearanceRadiusCells = _ensureNumber(pathCfgSpur.InitialClearanceRadiusCells, SP.InitialClearanceRadiusCells, "PathGen.Spur.InitialClearance")
+
+				local spurRadiusStuds = localRandomFloat(SP.RadiusStudsMin, SP.RadiusStudsMax)
+				local spurLengthStuds = localRandomFloat(SP.LengthStudsMin, SP.LengthStudsMax)
+				local spurSegLenCells = SP.SegmentBaseLengthStuds / cellSize
+				local spurNumSegments = math.max(1, math.ceil(spurLengthStuds / SP.SegmentBaseLengthStuds))
+
+				Logger:Debug("Phase_CarveSkeleton_Spur", "Attempt Spur %d (TrunkPt %d): Dir %s, R%.1f, L%.1f, Segs %d",
+					spursMade+1,candidateTrunkPointIndex_spur,tostring(spurInitialDir),spurRadiusStuds,spurLengthStuds,spurNumSegments)
+
+				local spurPathPoints = _generateWindingPath_PerlinAdvanced(
+					spurStartPoint, spurInitialDir, spurNumSegments, spurSegLenCells, spurLengthStuds,
+					SP.PathPerlin_MaxTurnDeg, SP.PathPerlin_YawNoiseScale, SP.PathPerlin_YawStrengthFactor,
+					SP.PathPerlin_PitchNoiseScale, SP.PathPerlin_PitchStrengthFactor, 
+					Rng:NextNumber()*1e4+300+candidateTrunkPointIndex_spur, pathCfgSpur
+				)
+				if #spurPathPoints >= 2 then
+					local spurRadiusCells = math.max(1, math.floor(spurRadiusStuds / cellSize))
+					for k_s=1, #spurPathPoints-1 do
+						local p1s,p2s = spurPathPoints[k_s],spurPathPoints[k_s+1]; if not p1s or not p2s then Logger:Warn("Phase_CarveSkeleton_Spur", "Nil point in spur path. Skipping segment."); break end
+						local currentSpurRC = spurRadiusCells
+						if SP.RadiusVarianceNoiseScale > 0 and SP.RadiusVarianceFactor > 0 then
+							local prog_sp = (k_s-1)/math.max(1,#spurPathPoints-2)
+							local lenSoFar_sp = prog_sp*spurNumSegments*spurSegLenCells
+							local rNoiseIn_sp = lenSoFar_sp*SP.RadiusVarianceNoiseScale+(Rng:NextNumber()*100+500+k_s)
+							local rNoiseVal_sp = (Perlin.Noise(rNoiseIn_sp,Rng:NextNumber()*10,Rng:NextNumber()*10)*2)-1
+							currentSpurRC = currentSpurRC*(1+rNoiseVal_sp*SP.RadiusVarianceFactor); currentSpurRC = math.max(1,math.floor(currentSpurRC))
+						end
+						_carveCylinderGrid(grid,p1s,p2s,currentSpurRC,AIR)
+						if k_s%5==0 then doYield() end
+					end
+					table.insert(collectedSpurPaths, spurPathPoints)
+					spursMade=spursMade+1
+					Logger:Info("Phase_CarveSkeleton_Spur", "Spur %d carved.", spursMade)
+				else Logger:Warn("Phase_CarveSkeleton_Spur", "Spur path gen failed at TrunkPt %d (<2 pts).",candidateTrunkPointIndex_spur) end
+			end
+			doYield()
+		end
+	end 
+	skeletonData.spurPaths = collectedSpurPaths
+	Logger:Info("Phase_CarveSkeleton", "%d Secondary Spurs Made (off trunk).", spursMade)
+
+	Logger:Debug("Phase_CarveSkeleton_Return", "Returning skeletonData. Trunk points: %d, Branch path sets: %d, Spur path sets: %d",
+		(skeletonData.trunkPath and #skeletonData.trunkPath or 0),
+		(skeletonData.branchPaths and #skeletonData.branchPaths or 0),
+		(skeletonData.spurPaths and #skeletonData.spurPaths or 0)
+	)
+	Logger:Info("Phase_CarveSkeleton", "Phase (Skeleton Carve) Finished! Total Time: %.2fs", os.clock() - startTime)
+	return skeletonData
+end
+
+local function Phase_ConnectLoops(skeletonDataReceived)
+	Logger:Info("Phase_ConnectLoops", "Starting Full Loop Generation...")
+	local startTime = os.clock()
+
+	if not skeletonDataReceived or not skeletonDataReceived.branchPaths or #skeletonDataReceived.branchPaths < 2 then
+		Logger:Warn("Phase_ConnectLoops", "Not enough branch paths in skeletonData to attempt loops. Need at least 2. Skipping.")
+		Logger:Info("Phase_ConnectLoops", "Finished (skipped due to insufficient branch paths). Time: %.2fs", os.clock() - startTime)
+		return -- Return here, no need to store in skeletonDataReceived for this phase usually
+	end
+
+	local allPrimaryBranchPaths = skeletonDataReceived.branchPaths
+	local numLoopsToAttempt = localRandomInt(1, 2) -- Or get from CaveConfig
+	local loopsMade = 0
+
+	-- Loop Connection Parameters (Consider moving more to CaveConfig later)
+	local loopConnectionRadiusStuds_MinMax = CaveConfig.LoopConnector_PathPerlin and CaveConfig.LoopConnector_PathPerlin.RadiusStuds_MinMax or {min = 3, max = 6} -- Get from config or default
+	local maxDistanceBetweenEndpointsStuds = CaveConfig.LoopConnector_PathPerlin and CaveConfig.LoopConnector_PathPerlin.MaxDistanceStuds or 80      -- Get from config or default
+
+	local availableBranchIndices = {}
+	for i = 1, #allPrimaryBranchPaths do table.insert(availableBranchIndices, i) end
+
+	-- Main loop to attempt creating the desired number of loops
+	for attempt = 1, numLoopsToAttempt * 5 do -- Try more times than needed in case pairs are bad
+		if loopsMade >= numLoopsToAttempt then break end
+		if #availableBranchIndices < 2 then 
+			Logger:Debug("Phase_ConnectLoops", "Not enough unique branches left to form more loops.")
+			break 
+		end
+
+		local proceedWithThisSpecificLoopAttempt = true -- Flag for current pair validity
+
+		-- Select two different random branches
+		localShuffleTable(availableBranchIndices)
+		local branchIndex1 = availableBranchIndices[1]
+		local branchIndex2 = availableBranchIndices[2]
+		local path1, path2, endPoint1, endPoint2
+
+		-- Validate selected branches and their paths
+		if not (allPrimaryBranchPaths[branchIndex1] and #allPrimaryBranchPaths[branchIndex1] > 0) then
+			Logger:Warn("Phase_ConnectLoops", "Branch path at index %d is invalid or empty for loop attempt %d. Removing from available.", branchIndex1, attempt)
+			table.remove(availableBranchIndices, 1) -- Remove the bad index
+			proceedWithThisSpecificLoopAttempt = false
+		end
+
+		if proceedWithThisSpecificLoopAttempt then
+			if not (allPrimaryBranchPaths[branchIndex2] and #allPrimaryBranchPaths[branchIndex2] > 0) then
+				Logger:Warn("Phase_ConnectLoops", "Branch path at index %d is invalid or empty for loop attempt %d. Removing from available.", branchIndex2, attempt)
+				-- Find and remove branchIndex2. Since [1] might have been removed, its position might be [1] now if it was originally [2].
+				local actualIndexForB2 = -1
+				for k, v in ipairs(availableBranchIndices) do if v == branchIndex2 then actualIndexForB2 = k; break; end end
+				if actualIndexForB2 > 0 then table.remove(availableBranchIndices, actualIndexForB2) end
+				proceedWithThisSpecificLoopAttempt = false
+			end
+		end
+
+		if proceedWithThisSpecificLoopAttempt then
+			path1 = allPrimaryBranchPaths[branchIndex1]
+			path2 = allPrimaryBranchPaths[branchIndex2]
+			endPoint1 = path1[#path1] 
+			endPoint2 = path2[#path2] 
+
+			local distanceStuds = (endPoint1 - endPoint2).Magnitude * cellSize
+
+			Logger:Trace("Phase_ConnectLoops", "Considering loop (Attempt %d) between branch %d (end %s) and branch %d (end %s). Distance: %.1f studs",
+				attempt, branchIndex1, tostring(endPoint1), branchIndex2, tostring(endPoint2), distanceStuds)
+
+			local minSegLengthStuds = (CaveConfig.PathGeneration.LoopConnector and CaveConfig.PathGeneration.LoopConnector.SegmentBaseLengthStuds or 10)
+			if distanceStuds < (minSegLengthStuds * 1.5) or distanceStuds > maxDistanceBetweenEndpointsStuds then
+				Logger:Trace("Phase_ConnectLoops", "Loop Attempt %d: Distance (%.1f studs) not suitable. MinReq: %.1f, MaxAllow: %.1f. Skipping this pair.", 
+					attempt, distanceStuds, minSegLengthStuds * 1.5, maxDistanceBetweenEndpointsStuds)
+				proceedWithThisSpecificLoopAttempt = false
+			end
+		end
+
+		if proceedWithThisSpecificLoopAttempt then
+			local loopInitialDir = (endPoint2 - endPoint1).Unit
+			if loopInitialDir.Magnitude < 0.1 then loopInitialDir = Vector3.new(localRandomFloat(-1,1),0,localRandomFloat(-1,1)).Unit end
+			if loopInitialDir.Magnitude < 0.1 then loopInitialDir = Vector3.new(1,0,0) end
+
+			local loopRadiusStuds = localRandomFloat(loopConnectionRadiusStuds_MinMax.min, loopConnectionRadiusStuds_MinMax.max)
+			local loopRadiusCells = math.max(1, math.floor(loopRadiusStuds / cellSize))
+
+			local loopPathGenParams = CaveConfig.PathGeneration.LoopConnector
+			local params_valid_for_path = true
+
+			if not loopPathGenParams then
+				Logger:Error("Phase_ConnectLoops", "CRITICAL: CaveConfig.PathGeneration.LoopConnector is missing! Cannot generate loop path for attempt %d.", attempt)
+				params_valid_for_path = false
+			end
+
+			local segBaseStuds, maxTurnDeg, yawScale, yawStr, pitchScale, pitchStr
+			if params_valid_for_path then
+				segBaseStuds = loopPathGenParams.SegmentBaseLengthStuds
+				maxTurnDeg = loopPathGenParams.PathPerlin_MaxTurnDeg 
+				yawScale = loopPathGenParams.PathPerlin_YawNoiseScale
+				yawStr = loopPathGenParams.PathPerlin_YawStrengthFactor
+				pitchScale = loopPathGenParams.PathPerlin_PitchNoiseScale
+				pitchStr = loopPathGenParams.PathPerlin_PitchStrengthFactor
+
+				if not (type(segBaseStuds) == "number" and type(maxTurnDeg) == "number" and
+					type(yawScale) == "number" and type(yawStr) == "number" and
+					type(pitchScale) == "number" and type(pitchStr) == "number") then
+					Logger:Error("Phase_ConnectLoops", "CRITICAL: One or more required PathPerlin parameters are missing or not numbers in CaveConfig.PathGeneration.LoopConnector for attempt %d. Skipping.", attempt)
+					params_valid_for_path = false
+				end
+			end
+
+			if params_valid_for_path then
+				local loopSegLenCells = segBaseStuds / cellSize
+				local loopLengthStuds = (endPoint1 - endPoint2).Magnitude * cellSize -- Recalculate from original endpoints just in case
+				local loopNumSegments = math.max(3, math.ceil(loopLengthStuds / segBaseStuds)) 
+
+				Logger:Debug("Phase_ConnectLoops", "Attempting Loop Path (Loop #%d, Overall Attempt %d): Connect branch %d to branch %d. R_studs: %.1f, L_studs: %.1f, NumSeg: %d, SegLenCells: %.1f",
+					loopsMade + 1, attempt, branchIndex1, branchIndex2, loopRadiusStuds, loopLengthStuds, loopNumSegments, loopSegLenCells)
+
+				local loopPathPoints = _generateWindingPath_PerlinAdvanced(
+					endPoint1, loopInitialDir,
+					loopNumSegments, loopSegLenCells,
+					loopLengthStuds,
+					maxTurnDeg,
+					yawScale, yawStr,
+					pitchScale, pitchStr,
+					Rng:NextNumber() * 10000 + 400.0 + attempt, 
+					loopPathGenParams 
+				)
+
+				if #loopPathPoints >= 2 then 
+					loopPathPoints[#loopPathPoints] = endPoint2 -- Refine endpoint for clean connection
+
+					for k = 1, #loopPathPoints - 1 do
+						_carveCylinderGrid(grid, loopPathPoints[k], loopPathPoints[k+1], loopRadiusCells, AIR)
+						if k % 3 == 0 then doYield() end
+					end
+					loopsMade = loopsMade + 1
+					Logger:Info("Phase_ConnectLoops", "Loop #%d successfully carved connecting branch %d and %d.", loopsMade, branchIndex1, branchIndex2)
+
+					-- Remove used branches from consideration (find by value now, as indices shift)
+					local idx1ToRemove = -1; for k,v in ipairs(availableBranchIndices) do if v == branchIndex1 then idx1ToRemove = k; break; end end
+					if idx1ToRemove > 0 then table.remove(availableBranchIndices, idx1ToRemove) end
+
+					local idx2ToRemove = -1; for k,v in ipairs(availableBranchIndices) do if v == branchIndex2 then idx2ToRemove = k; break; end end
+					if idx2ToRemove > 0 then table.remove(availableBranchIndices, idx2ToRemove) end
+				else
+					Logger:Warn("Phase_ConnectLoops", "Loop connector path generation failed (less than 2 points) for attempt %d.", attempt)
+				end
+			else
+				Logger:Warn("Phase_ConnectLoops", "Skipping loop attempt %d due to missing/invalid config parameters for path generation.", attempt)
+			end
+		end -- end of if proceedWithThisSpecificLoopAttempt
+		doYield()
+	end -- End of for attempt loop
+
+	Logger:Info("Phase_ConnectLoops", "%d Full Loops Made. Finished! Time: %.2fs", loopsMade, os.clock() - startTime)
+end
+
+local function Phase_GenerateMultiLevels(skeletonDataReceived)
+	Logger:Info("Phase0B_MultiLevel", "Starting Multi-Level Trunk & Shaft Generation...")
+	local startTime = os.clock()
+
+	if not skeletonDataReceived or not skeletonDataReceived.trunkPath or #skeletonDataReceived.trunkPath == 0 then
+		Logger:Warn("Phase0B_MultiLevel", "Main trunk path not available in skeletonData. Skipping multi-level generation.")
+		Logger:Info("Phase0B_MultiLevel", "Finished (skipped). Time: %.2fs", os.clock() - startTime)
+		return skeletonDataReceived -- Return original data if skipping
+	end
+
+	local originalTrunkPath = skeletonDataReceived.trunkPath
+
+	-- Multi-Level Parameters (Move to CaveConfig later)
+	local createUpperLevel = true -- Toggle for upper level
+	local upperLevelYOffsetStuds = localRandomFloat(8, 10)
+	local upperLevelRadiusStuds_MinMax = {min = 5, max = 9} -- Can be different from main trunk
+
+	local createLowerLevel = true -- Toggle for lower level
+	local lowerLevelYOffsetStuds = localRandomFloat(6, 8)
+	local lowerLevelRadiusStuds_MinMax = {min = 4, max = 7} -- Can be tighter
+
+	local numConnectingShaftsPerLevel = localRandomInt(2, 4)
+	local shaftRadiusStuds_MinMax = {min = 2, max = 4}
+	local shaftBlendRadiusFactor = 1.5 -- e.g., shaft radius * 1.5 for blending sphere
+
+	local newLevelPaths = {} -- To store newly created level paths, might add to skeletonData
+
+	-- Function to generate and carve a parallel trunk
+	local function createAndCarveParallelTrunk(basePath, yOffsetStuds, radiusStuds_MinMax, levelName)
+		Logger:Info("Phase0B_MultiLevel", "Creating %s level.", levelName)
+		local yOffsetCells = math.round(yOffsetStuds / cellSize)
+		if yOffsetCells == 0 then
+			Logger:Warn("Phase0B_MultiLevel", "%s Y-offset in cells is 0. Skipping level.", levelName)
+			return nil
+		end
+
+		local newPath = {}
+		for _, p_orig in ipairs(basePath) do
+			table.insert(newPath, Vector3.new(p_orig.X, p_orig.Y + yOffsetCells, p_orig.Z))
+		end
+
+		if #newPath < 2 then
+			Logger:Warn("Phase0B_MultiLevel", "%s path has less than 2 points. Skipping carving.", levelName)
+			return nil
+		end
+
+		local startRadiusStuds = radiusStuds_MinMax.min
+		local endRadiusStuds = radiusStuds_MinMax.max
+		local startRadiusCells = math.max(1, math.floor(startRadiusStuds / cellSize))
+		local endRadiusCells = math.max(1, math.floor(endRadiusStuds / cellSize))
+		local radiusVariance = 0.1 -- Less variance for these parallel trunks for simplicity
+
+		Logger:Debug("Phase0B_MultiLevel", "%s: %d points, Y Offset: %d cells. RadiusStuds Range: %.1f-%.1f", levelName, #newPath, yOffsetCells, radiusStuds_MinMax.min, radiusStuds_MinMax.max)
+
+		for i = 1, #newPath - 1 do
+			local p1 = newPath[i]
+			local p2 = newPath[i+1]
+			local progress = (i-1) / math.max(1, #newPath - 2)
+			local baseRCells = lerp(startRadiusCells, endRadiusCells, progress)
+			local variedRCells = math.max(1, math.floor(baseRCells * (1 + localRandomFloat(-radiusVariance, radiusVariance))))
+
+			_carveCylinderGrid(grid, p1, p2, variedRCells, AIR)
+			if i % 10 == 0 then doYield() end
+		end
+		Logger:Info("Phase0B_MultiLevel", "%s level carving finished.", levelName)
+		return newPath
+	end
+
+	-- Create Upper Level
+	if createUpperLevel then
+		local upperPath = createAndCarveParallelTrunk(originalTrunkPath, upperLevelYOffsetStuds, upperLevelRadiusStuds_MinMax, "Upper")
+		if upperPath then table.insert(newLevelPaths, {name = "Upper", path = upperPath}) end
+	end
+
+	-- Create Lower Level
+	if createLowerLevel then
+		local lowerPath = createAndCarveParallelTrunk(originalTrunkPath, -lowerLevelYOffsetStuds, lowerLevelRadiusStuds_MinMax, "Lower") -- Negative offset
+		if lowerPath then table.insert(newLevelPaths, {name = "Lower", path = lowerPath}) end
+	end
+
+	-- Connecting Shafts
+	if #newLevelPaths > 0 and #originalTrunkPath > 2 then
+		Logger:Info("Phase0B_MultiLevel", "Creating Connecting Shafts...")
+		for _, levelData in ipairs(newLevelPaths) do
+			local levelPath = levelData.path
+			if not levelPath or #levelPath < 2 then continue end
+
+			local shaftsToThisLevelMade = 0
+			local shaftAnchorIndicesOnTrunk = {}
+			for i = math.floor(#originalTrunkPath * 0.1), math.floor(#originalTrunkPath * 0.9) do -- Mid 80% of trunk
+				table.insert(shaftAnchorIndicesOnTrunk, i)
+			end
+			localShuffleTable(shaftAnchorIndicesOnTrunk)
+
+			for i = 1, math.min(numConnectingShaftsPerLevel, #shaftAnchorIndicesOnTrunk) do
+				local trunkAnchorIndex = shaftAnchorIndicesOnTrunk[i]
+				if not originalTrunkPath[trunkAnchorIndex] then continue end
+				local trunkPoint = originalTrunkPath[trunkAnchorIndex]
+
+				-- Find closest point on the current levelPath to this trunkPoint (in XZ plane)
+				local closestLevelPoint = levelPath[1]
+				local minDistSqXZ = math.huge
+				if not closestLevelPoint then continue end
+
+				for _, lp in ipairs(levelPath) do
+					local distSq = (lp.X - trunkPoint.X)^2 + (lp.Z - trunkPoint.Z)^2
+					if distSq < minDistSqXZ then
+						minDistSqXZ = distSq
+						closestLevelPoint = lp
+					end
+				end
+
+				local shaftRadiusStuds = localRandomFloat(shaftRadiusStuds_MinMax.min, shaftRadiusStuds_MinMax.max)
+				local shaftRadiusCells = math.max(2, math.floor(shaftRadiusStuds / cellSize))
+
+				-- Shaft Point 1 (on main trunk, or slightly offset if needed)
+				local shaftP1 = trunkPoint
+				-- Shaft Point 2 (on new level trunk, adjusted Y from closestLevelPoint if needed)
+				local shaftP2 = Vector3.new(closestLevelPoint.X, closestLevelPoint.Y, closestLevelPoint.Z)
+				-- Ensure P1 is lower than P2 if shafting up, or vice-versa, just for consistent carving logic if it mattered.
+				-- Here, _carveCylinderGrid handles arbitrary p1,p2.
+
+				Logger:Debug("Phase0B_MultiLevel", "Shaft %d for %s: TrunkPt(%s) to LevelPt(%s), R_studs:%.1f",
+					shaftsToThisLevelMade + 1, levelData.name, tostring(shaftP1), tostring(shaftP2), shaftRadiusStuds)
+
+				_carveCylinderGrid(grid, shaftP1, shaftP2, shaftRadiusCells, AIR)
+
+				-- Blending "lips"
+				local blendRadiusCells = math.max(shaftRadiusCells, math.floor(shaftRadiusCells * shaftBlendRadiusFactor))
+				_carveSphereGrid(grid, shaftP1.X, shaftP1.Y, shaftP1.Z, blendRadiusCells, AIR)
+				_carveSphereGrid(grid, shaftP2.X, shaftP2.Y, shaftP2.Z, blendRadiusCells, AIR)
+
+				shaftsToThisLevelMade = shaftsToThisLevelMade + 1
+				doYield()
+			end
+			Logger:Info("Phase0B_MultiLevel", "%d shafts made to %s level.", shaftsToThisLevelMade, levelData.name)
+		end
+	end
+
+	-- Optionally, add newLevelPaths to skeletonData if other phases might use them
+	-- For now, they are just carved.
+	if not skeletonDataReceived.extraLevelPaths then skeletonDataReceived.extraLevelPaths = {} end
+	for _, levelData in ipairs(newLevelPaths) do
+		table.insert(skeletonDataReceived.extraLevelPaths, levelData)
+	end
+
+	Logger:Info("Phase0B_MultiLevel", "Multi-Level Generation Finished! Time: %.2fs", os.clock() - startTime)
+	return skeletonDataReceived -- Return the (potentially modified) skeletonData
+end
+
+local function Phase_VaryPassageWidths(skeletonDataReceived)
+	Logger:Info("Phase_VaryPassageWidths", "Starting Passage Variation (Pinch-Points)...")
+	local startTime = os.clock()
+
+	if not skeletonDataReceived then
+		Logger:Warn("Phase_VaryPassageWidths", "Skeleton data is NIL. Skipping.")
+		return skeletonDataReceived
+	end
+
+	-- Parameters (Move to CaveConfig later)
+	local pinchChancePerTunnel = 0.3 -- Chance each major tunnel part gets a pinch
+	local numPinchesPerSelectedTunnel = localRandomInt(1, 2)
+	local pinchLengthStuds_MinMax = {min = 10, max = 20} -- Length of the pinched segment
+	-- How much smaller the radius becomes (in cells). 1 means radius shrinks by 1 cell.
+	local pinchRadiusReductionCells_MinMax = {min = 1, max = 1} -- For main tunnels. Can be {1,2} for more aggressive.
+	-- Ensure originalRadius - reduction >= 1
+	local pinchBlendRadiusFactor = 1.2 -- Blend sphere is pinchRadius * this factor
+
+	local allPathsToProcess = {}
+	if skeletonDataReceived.trunkPath and #skeletonDataReceived.trunkPath > 0 then
+		table.insert(allPathsToProcess, {path = skeletonDataReceived.trunkPath, type = "Trunk"})
+	end
+	if skeletonDataReceived.branchPaths then
+		for i, p in ipairs(skeletonDataReceived.branchPaths) do
+			if p and #p > 0 then table.insert(allPathsToProcess, {path = p, type = "Branch"..i}) end
+		end
+	end
+	if skeletonDataReceived.extraLevelPaths then -- From multi-level
+		for i, levelData in ipairs(skeletonDataReceived.extraLevelPaths) do
+			if levelData and levelData.path and #levelData.path > 0 then
+				table.insert(allPathsToProcess, {path = levelData.path, type = levelData.name.."_LevelTrunk"})
+			end
+		end
+	end
+	if skeletonDataReceived.loopConnectorPaths then -- (If we add this to skeletonData from Phase0A)
+		for i, p in ipairs(skeletonDataReceived.loopConnectorPaths) do
+			if p and #p > 0 then table.insert(allPathsToProcess, {path = p, type = "LoopConnector"..i}) end
+		end
+	end
+	-- Not doing spurs for now, they are already thin.
+
+	local pinchesMadeTotal = 0
+
+	for _, pathData in ipairs(allPathsToProcess) do
+		local currentPath = pathData.path
+		local pathType = pathData.type
+		if #currentPath < 5 then continue end -- Path too short for meaningful pinch
+
+		if localRandomChance(pinchChancePerTunnel) then
+			for pinchAttempt = 1, numPinchesPerSelectedTunnel do
+				-- Select a random segment (sequence of points) along this path for the pinch
+				local pinchLengthStuds = localRandomFloat(pinchLengthStuds_MinMax.min, pinchLengthStuds_MinMax.max)
+				local pinchLengthCells = pinchLengthStuds / cellSize
+
+				-- Determine approximate number of path segments for this pinch length
+				-- Assumes path segments are somewhat uniform in length (e.g. ~3.75 cells from _generateWindingPath)
+				local avgSegLenCells = 3.75 -- Estimate, or calculate from path
+				local numSegmentsForPinch = math.max(2, math.ceil(pinchLengthCells / avgSegLenCells))
+
+				if #currentPath < numSegmentsForPinch + 2 then continue end -- Not enough segments in path
+
+				local pinchStartIndex = localRandomInt(2, #currentPath - numSegmentsForPinch - 1)
+				local pinchEndIndex = pinchStartIndex + numSegmentsForPinch
+
+				if not currentPath[pinchStartIndex] or not currentPath[pinchEndIndex] then
+					Logger:Warn("Phase_VaryPassageWidths", "Invalid indices for pinch on %s.", pathType)
+					continue
+				end
+
+				local p_start_pinch = currentPath[pinchStartIndex]
+				local p_end_pinch = currentPath[pinchEndIndex]
+
+				-- Estimate original radius. This is tricky as it varied.
+				-- For now, let's assume a typical original radius for that path type.
+				-- Trunk/Levels: 2-3 cells. Branches: 2 cells. Loops: 1-2 cells.
+				-- This needs better passing of original radius data OR re-estimation based on nearby cells.
+				-- Let's just use a default for now and make the pinch absolute.
+				local assumedOriginalRadiusCells = 2
+				if string.find(pathType, "Trunk") then assumedOriginalRadiusCells = 3 end
+
+				local radiusReduction = localRandomInt(pinchRadiusReductionCells_MinMax.min, pinchRadiusReductionCells_MinMax.max)
+				local pinchFinalRadiusCells = math.max(1, assumedOriginalRadiusCells - radiusReduction)
+
+				-- Step 1: Fill the segment SOLID to create the constriction "walls"
+				-- The fill radius should be based on assumedOriginalRadiusCells
+				Logger:Debug("Phase_VaryPassageWidths", "Pinching %s: Seg %d-%d. OrigR_est:%d, PinchR:%d",
+					pathType, pinchStartIndex, pinchEndIndex, assumedOriginalRadiusCells, pinchFinalRadiusCells)
+
+				for i = pinchStartIndex, pinchEndIndex -1 do
+					if not currentPath[i] or not currentPath[i+1] then break end
+					-- Fill slightly wider than original to ensure it connects to existing walls
+					_carveCylinderGrid(grid, currentPath[i], currentPath[i+1], assumedOriginalRadiusCells + 1, SOLID)
+				end
+				doYield()
+
+				-- Step 2: Re-carve the narrower AIR passage through the SOLID block
+				for i = pinchStartIndex, pinchEndIndex -1 do
+					if not currentPath[i] or not currentPath[i+1] then break end
+					_carveCylinderGrid(grid, currentPath[i], currentPath[i+1], pinchFinalRadiusCells, AIR)
+				end
+				pinchesMadeTotal = pinchesMadeTotal + 1
+				doYield()
+
+				-- Blending: Carve spheres at the start and end of the pinched segment
+				local blendRadiusCells = math.max(pinchFinalRadiusCells + 1, math.floor(pinchFinalRadiusCells * pinchBlendRadiusFactor))
+				if currentPath[pinchStartIndex-1] then -- Blend with previous segment if exists
+					_carveSphereGrid(grid, p_start_pinch.X, p_start_pinch.Y, p_start_pinch.Z, blendRadiusCells, AIR)
+				end
+				if currentPath[pinchEndIndex+1] then -- Blend with next segment if exists
+					_carveSphereGrid(grid, p_end_pinch.X, p_end_pinch.Y, p_end_pinch.Z, blendRadiusCells, AIR)
+				end
+			end
+		end
+	end
+
+	Logger:Info("Phase_VaryPassageWidths", "%d Pinch-Points created. Finished! Time: %.2fs", pinchesMadeTotal, os.clock() - startTime)
+	return skeletonDataReceived -- Return skeletonData, possibly unchanged in structure but grid is modified
+end
+
+local function Phase_CarveChambers(skeletonDataReceived)
+	Logger:Info("Phase_CarveChambers", "Starting Chamber and Dome Generation...")
+	local startTime = os.clock()
+
+	if not skeletonDataReceived then
+		Logger:Warn("Phase_CarveChambers", "Skeleton data is NIL. Skipping chamber generation.")
+		Logger:Info("Phase_CarveChambers", "Finished (skipped due to NIL data)! Time: %.2fs", os.clock() - startTime)
+		return
+	end
+	if not skeletonDataReceived.trunkPath or (#skeletonDataReceived.trunkPath == 0 and (#skeletonDataReceived.branchPaths == 0 or not skeletonDataReceived.branchPaths)) then
+		Logger:Warn("Phase_CarveChambers", "Skeleton data missing trunkPath (or it's empty) AND no branchPaths. Skipping chamber generation.")
+		Logger:Info("Phase_CarveChambers", "Finished (skipped due to insufficient path data)! Time: %.2fs", os.clock() - startTime)
+		return
+	end
+	if not skeletonDataReceived.branchPaths then
+		Logger:Warn("Phase_CarveChambers", "Skeleton data branchPaths is NIL. Some chamber logic might rely on it.")
+		-- We can proceed but primary hall anchor choices will be limited.
+	end
+
+	local numPrimaryHalls = localRandomInt(2, 3)
+	local primaryHallRadiusStuds_MinMax = {min = 15, max = 20}
+	local numSecondaryChambersPerBranch = localRandomInt(0, 2) 
+	local secondaryChamberRadiusStuds_MinMax = {min = 8, max = 12}
+
+	local mainTrunkPath = skeletonDataReceived.trunkPath or {} -- Use empty table if nil, though above check should catch it
+	local allPrimaryBranchPaths = skeletonDataReceived.branchPaths or {} -- Use empty table if nil
+
+	Logger:Debug("Phase_CarveChambers", "Received skeleton data. Trunk points: %d, Branch path sets: %d",
+		#mainTrunkPath, #allPrimaryBranchPaths)
+	if #allPrimaryBranchPaths > 0 then
+		if allPrimaryBranchPaths[1] and #allPrimaryBranchPaths[1] > 0 then
+			Logger:Debug("Phase_CarveChambers", "First branch path received in Phase1 has %d points.", #allPrimaryBranchPaths[1])
+		else
+			Logger:Debug("Phase_CarveChambers", "First branch path in list received in Phase1 is empty or nil.")
+		end
+	else
+		Logger:Debug("Phase_CarveChambers", "No branch paths collected/received or branchPaths table is empty.")
+	end
+
+	-- Logic for Primary Halls
+	Logger:Debug("Phase_CarveChambers", "Attempting to create %d primary halls.", numPrimaryHalls)
+	local potentialHallAnchors = {}
+
+	if #allPrimaryBranchPaths > 0 then
+		for _, branchPath_table in ipairs(allPrimaryBranchPaths) do
+			if branchPath_table and #branchPath_table > 0 then
+				table.insert(potentialHallAnchors, branchPath_table[1]) 
+			end
+		end
+		Logger:Debug("Phase_CarveChambers", "Collected %d branch starting points as potential hall anchors.", #potentialHallAnchors)
+	end
+
+	if #potentialHallAnchors == 0 and #mainTrunkPath > 2 then
+		Logger:Debug("Phase_CarveChambers", "No/few branch start points from branchPaths, using trunk mid-points as fallback for halls.")
+		local firstTrunkAnchor = math.max(1, math.floor(#mainTrunkPath * 0.2))
+		local lastTrunkAnchor = math.min(#mainTrunkPath, math.floor(#mainTrunkPath * 0.8))
+		if lastTrunkAnchor >= firstTrunkAnchor then
+			for i = firstTrunkAnchor, lastTrunkAnchor do
+				if mainTrunkPath[i] then
+					table.insert(potentialHallAnchors, mainTrunkPath[i])
+				end
+			end
+		end
+		Logger:Debug("Phase_CarveChambers", "Collected %d fallback trunk points as potential hall anchors.", #potentialHallAnchors)
+	end
+
+	if #potentialHallAnchors > 0 then
+		localShuffleTable(potentialHallAnchors)
+		local hallsCreated = 0
+		for i = 1, math.min(numPrimaryHalls, #potentialHallAnchors) do
+			local hallCenterPoint = potentialHallAnchors[i]
+			if not hallCenterPoint then 
+				Logger:Warn("Phase_CarveChambers", "Hall center point is nil for primary hall attempt %d. Index was %d.", hallsCreated + 1, i)
+				continue
+			end
+
+			local hallRadiusStuds = localRandomFloat(primaryHallRadiusStuds_MinMax.min, primaryHallRadiusStuds_MinMax.max)
+			local hallRadiusCells = math.max(1, math.floor(hallRadiusStuds / cellSize))
+
+			Logger:Debug("Phase_CarveChambers", "Creating Primary Hall %d at (%s) R_studs: %.1f (R_cells: %d)",
+				hallsCreated + 1, tostring(hallCenterPoint), hallRadiusStuds, hallRadiusCells)
+
+			_carveSphereGrid(grid, hallCenterPoint.X, hallCenterPoint.Y, hallCenterPoint.Z, hallRadiusCells, AIR)
+			hallsCreated = hallsCreated + 1
+			doYield()
+		end
+		Logger:Info("Phase_CarveChambers", "%d Primary Halls created.", hallsCreated)
+	else
+		Logger:Warn("Phase_CarveChambers", "No potential anchor points found for primary halls.")
+	end
+
+	-- Logic for Secondary Chambers
+	Logger:Debug("Phase_CarveChambers", "Attempting secondary chambers on %d primary branches.", #allPrimaryBranchPaths)
+	if #allPrimaryBranchPaths > 0 then
+		local secChambersMade = 0
+		for branchIdx, branchPath_table in ipairs(allPrimaryBranchPaths) do 
+			if numSecondaryChambersPerBranch > 0 and branchPath_table and #branchPath_table > 3 then
+				for _ = 1, numSecondaryChambersPerBranch do
+					local pointIndexOnBranch = localRandomInt(math.max(2, math.floor(#branchPath_table * 0.2)), math.min(#branchPath_table - 1, math.floor(#branchPath_table * 0.8)))
+					if pointIndexOnBranch > 0 and pointIndexOnBranch <= #branchPath_table and branchPath_table[pointIndexOnBranch] then
+						local chamberCenterPoint = branchPath_table[pointIndexOnBranch]
+						local chamberRadiusStuds = localRandomFloat(secondaryChamberRadiusStuds_MinMax.min, secondaryChamberRadiusStuds_MinMax.max)
+						local chamberRadiusCells = math.max(1, math.floor(chamberRadiusStuds / cellSize))
+
+						Logger:Debug("Phase_CarveChambers", "Creating Secondary Chamber on branch %d (path index %d) at (%s) R_studs: %.1f (R_cells: %d)",
+							branchIdx, pointIndexOnBranch, tostring(chamberCenterPoint), chamberRadiusStuds, chamberRadiusCells)
+
+						_carveSphereGrid(grid, chamberCenterPoint.X, chamberCenterPoint.Y, chamberCenterPoint.Z, chamberRadiusCells, AIR)
+						secChambersMade = secChambersMade + 1
+						doYield()
+					else
+						Logger:Warn("Phase_CarveChambers", "Invalid pointIndexOnBranch or point for sec chamber on branch path %d.", branchIdx)
+					end
+				end
+			end
+		end
+		Logger:Info("Phase_CarveChambers", "%d Secondary Chambers created.", secChambersMade)
+	end
+
+	Logger:Info("Phase_CarveChambers", "Chamber and Dome Generation Finished! Total Time: %.2fs", os.clock() - startTime)
+end
+
+local function Phase_MesoDetailing(skeletonDataReceived) -- May or may not need skeletonData
+	Logger:Info("Phase_MesoDetailing", "Starting Meso Detailing (Scallops & Pockets)...")
+	local startTime = os.clock()
+
+	-- Parameters (Move to CaveConfig later)
+	local scallopChance = 0.05 -- Chance per valid surface cell to attempt a scallop
+	local scallopRadiusStuds_MinMax = {min = 1, max = 2}
+	local scallopDepthFactor = 0.5 -- How deep into the wall the scallop center is (0.5 = halfway in)
+
+	-- Get all SOLID cells that form CEILINGS or upper WALLS
+	-- Ceilings: SOLID cell with AIR above it. surfaceType = "Ceiling"
+	-- Walls: SOLID cell with AIR to its X/Z side. surfaceType = "WallPX", "WallNX", "WallPZ", "WallNZ"
+
+	-- This will get ALL solid surface cells. We will filter them.
+	local allSolidSurfaceCells = _getSurfaceCellsInfo(grid, SOLID, AIR)
+	Logger:Debug("Phase_MesoDetailing", "Found %d raw solid surface cell faces.", #allSolidSurfaceCells)
+
+	local scallopCandidateSurfaces = {}
+	for _, surfInfo in ipairs(allSolidSurfaceCells) do
+		-- We want ceilings (SOLID is below AIR, normal points UP)
+		-- and upper walls. For upper walls, we need a height check.
+		-- For now, let's include all walls and ceilings.
+		-- 'Ceiling' type means the SOLID cell at surfInfo.pos is *forming* the ceiling.
+		-- 'WallPX' etc. means the SOLID cell at surfInfo.pos is *forming* a wall.
+		if surfInfo.surfaceType == "Ceiling" or 
+			string.sub(surfInfo.surfaceType, 1, 4) == "Wall" then
+			-- Optional: Add height check for walls to only do "upper walls"
+			-- local worldY = origin.Y + (surfInfo.pos.Y - 0.5) * cellSize
+			-- if worldY is in the upper half of a passage, etc.
+			table.insert(scallopCandidateSurfaces, surfInfo)
+		end
+	end
+	Logger:Debug("Phase_MesoDetailing", "Filtered to %d ceiling/wall surface cell faces for scallops.", #scallopCandidateSurfaces)
+
+	local scallopsCarved = 0
+	if #scallopCandidateSurfaces > 0 then
+		for _, surfInfo in ipairs(scallopCandidateSurfaces) do
+			if localRandomChance(scallopChance) then
+				local scallopRadiusStuds = localRandomFloat(scallopRadiusStuds_MinMax.min, scallopRadiusStuds_MinMax.max)
+				local scallopRadiusCells = math.max(1, math.ceil(scallopRadiusStuds / cellSize)) -- Use ceil for slightly larger impact
+
+				-- Center of the scallop sphere should be INSIDE the solid wall/ceiling
+				-- surfInfo.pos is the SOLID surface cell. surfInfo.normal points into AIR.
+				-- We want to carve from surfInfo.pos IN THE OPPOSITE DIRECTION of surfInfo.normal (into the solid).
+				local carveCenter = surfInfo.pos - surfInfo.normal * (scallopRadiusCells * scallopDepthFactor)
+
+				Logger:Trace("Phase_MesoDetailing", "Scallop at SOLID %s (normal %s, type %s). Carve R:%d at %s",
+					tostring(surfInfo.pos), tostring(surfInfo.normal), surfInfo.surfaceType,
+					scallopRadiusCells, tostring(carveCenter))
+
+				_carveSphereGrid(grid, math.round(carveCenter.X), math.round(carveCenter.Y), math.round(carveCenter.Z),
+					scallopRadiusCells, AIR)
+				scallopsCarved = scallopsCarved + 1
+				if scallopsCarved % 100 == 0 then doYield() end
+			end
+		end
+	end
+
+	Logger:Info("Phase_MesoDetailing", "Starting Overhang Ledge Generation...")
+
+	-- Parameters for Ledges (Move to CaveConfig later)
+	local ledgeChancePerWallSurface = 0.02 -- Lower chance than scallops
+	local ledgeRadiusStuds_MinMax = {min = 2, max = 4}
+	local ledgeProtrusionFactor = 0.75 -- Center of sphere is this * radius out from wall
+	-- For filtering "high on walls"
+	local minLedgeHeightAboveFloorGuessCells = 3 -- Ledge must be at least this many cells above a guessed floor
+
+	local ledgesMade = 0
+	-- We iterate through scallopCandidateSurfaces which already contains walls and ceilings.
+	-- We only want walls for ledges.
+
+	for _, surfInfo in ipairs(scallopCandidateSurfaces) do -- Uses the same filtered list as scallops
+		if string.sub(surfInfo.surfaceType, 1, 4) == "Wall" then -- Only consider wall surfaces
+			if localRandomChance(ledgeChancePerWallSurface) then
+
+				-- Basic height check: is this wall cell "high enough"?
+				-- This is a rough guess. A better way would be to find the actual floor below.
+				local isHighEnough = true 
+				-- Check Y coord relative to some passage baseline, or if there's enough AIR below it
+				local airBelowCount = 0
+				for y_check = 1, minLedgeHeightAboveFloorGuessCells do
+					if grid:get(surfInfo.pos.X, surfInfo.pos.Y - y_check, surfInfo.pos.Z) == AIR then
+						airBelowCount = airBelowCount + 1
+					else
+						break -- Hit solid floor
+					end
+				end
+				if airBelowCount < minLedgeHeightAboveFloorGuessCells then
+					isHighEnough = false
+				end
+
+				if not isHighEnough then
+					-- Logger:Trace("Phase_MesoDetailing_Ledge", "Skipping ledge at %s, not high enough.", tostring(surfInfo.pos))
+					continue
+				end
+
+				local ledgeRadiusStuds = localRandomFloat(ledgeRadiusStuds_MinMax.min, ledgeRadiusStuds_MinMax.max)
+				local ledgeRadiusCells = math.max(1, math.ceil(ledgeRadiusStuds / cellSize))
+
+				-- Ledge sphere center: start at the SOLID wall cell, move OUTWARDS into AIR
+				-- surfInfo.normal points from SOLID into AIR.
+				local ledgeCenter = surfInfo.pos + surfInfo.normal * (ledgeRadiusCells * ledgeProtrusionFactor)
+
+				Logger:Debug("Phase_MesoDetailing_Ledge", "Attempting Ledge at SOLID wall %s (normal %s). LedgeCenter %s, R_cells:%d",
+					tostring(surfInfo.pos), tostring(surfInfo.normal), tostring(ledgeCenter), ledgeRadiusCells)
+
+				-- Add a SOLID sphere to form the ledge
+				_carveSphereGrid(grid, math.round(ledgeCenter.X), math.round(ledgeCenter.Y), math.round(ledgeCenter.Z),
+					ledgeRadiusCells, SOLID) 
+				ledgesMade = ledgesMade + 1
+
+				-- Blending the underside is more complex; skip for first pass.
+				-- It would involve finding the bottom surface cells of this new ledge and carving AIR.
+
+				if ledgesMade % 20 == 0 then doYield() end
+			end
+		end
+	end
+	Logger:Info("Phase_MesoDetailing", "%d Overhang Ledges created.", ledgesMade)
+
+
+	Logger:Info("Phase_MesoDetailing", "Meso Detailing Finished! Scallops: %d, Ledges: %d. Time: %.2fs", scallopsCarved, ledgesMade, os.clock() - startTime)
+	return skeletonDataReceived 
+end
+
+local function Phase_InitialNoiseCarve()
 	Logger:Info("Phase1", "Starting initial cave structure...")
 
 	-- Hierarchical Noise Configuration Print (Level: DEBUG)
@@ -472,7 +2028,12 @@ local function Phase1_InitialCaveFormation()
 end 
 
 local function _createFormation(startX,startY,startZ,type,endYForColumn) 
+	Logger:Debug("_createFormation_Enter", "Start (%d,%d,%d), Type: %s", startX,startY,startZ,type) -- Keep Enter
+
 	local length_cf=localRandomInt(CaveConfig.MinFormationLength_Cells,CaveConfig.MaxFormationLength_Cells)
+	-- Ensure no temporary hardcodes are left for length_cf or rCells_cf unless specifically testing them
+	Logger:Debug("_createFormation_Params", "Length_cf: %d, Type: %s", length_cf, type) -- Keep Params
+
 	local dirY_cf=(type=="stalactite") and -1 or 1
 	if type=="column" then 
 		if endYForColumn then 
@@ -483,10 +2044,22 @@ local function _createFormation(startX,startY,startZ,type,endYForColumn)
 		end
 		dirY_cf=1 
 	end 
+
+	local totalCellsSetForThisFormation = 0 -- Track total for this one formation
+
 	for i_cf=0,length_cf-1 do 
 		local curY_cf=startY+i_cf*dirY_cf
-		if not grid:isInBounds(startX,curY_cf,startZ) then break end
-		if type~="column" and i_cf>0 and grid:get(startX,curY_cf,startZ)==SOLID then break end
+		-- Logger:Debug("_createFormation_Loop", "i_cf: %d, curY: %d", i_cf, curY_cf) -- Maybe remove this or make TRACE
+
+		if not grid:isInBounds(startX,curY_cf,startZ) then 
+			-- Logger:Debug("_createFormation_Loop", "Centerline out of bounds. Breaking.")
+			break 
+		end
+		if type~="column" and i_cf>0 and grid:get(startX,curY_cf,startZ)==SOLID then 
+			-- Logger:Debug("_createFormation_Loop", "Hit existing SOLID on centerline. Breaking.")
+			break 
+		end
+
 		local radFactor_cf
 		if type=="column"then 
 			local prog_cf=0
@@ -496,51 +2069,152 @@ local function _createFormation(startX,startY,startZ,type,endYForColumn)
 			radFactor_cf=(length_cf-i_cf)/length_cf 
 		end
 		local bRad_cf=CaveConfig.BaseFormationRadius_Factor
+		-- Logger:Debug("_createFormation_RadiusCalc", "bRad_cf: %.2f, radFactor_cf: %.2f", bRad_cf, radFactor_cf) -- Maybe remove
+
 		if type=="column" then bRad_cf=bRad_cf*1.2 end
 		local rCells_cf=math.max(0,math.floor(bRad_cf*radFactor_cf))
+		-- Logger:Debug("_createFormation_RadiusCalc", "Final rCells_cf: %d", rCells_cf) -- Maybe remove
+
 		if type=="column" and length_cf<=2 then rCells_cf=math.max(0,math.floor(bRad_cf*.8))end 
+
+		local cellsSetThisYLevel = 0
 		for r_cf=0,rCells_cf do 
 			for dx_cf=-r_cf,r_cf do 
 				for dz_cf=-r_cf,r_cf do 
 					if math.sqrt(dx_cf*dx_cf+dz_cf*dz_cf)<=r_cf+.5 then 
 						local nx_cf,nz_cf=startX+dx_cf,startZ+dz_cf
-						if grid:isInBounds(nx_cf,curY_cf,nz_cf) then grid:set(nx_cf,curY_cf,nz_cf,SOLID) end
+						if grid:isInBounds(nx_cf,curY_cf,nz_cf) then 
+							if grid:get(nx_cf,curY_cf,nz_cf) == AIR then
+								grid:set(nx_cf,curY_cf,nz_cf,SOLID) 
+								cellsSetThisYLevel = cellsSetThisYLevel + 1
+								-- Logger:Trace("_createFormation_Set", ...) -- REMOVE THIS TRACE
+							end
+						end
 					end 
 				end 
 			end 
 		end 
-		if rCells_cf==0 then grid:set(startX,curY_cf,startZ,SOLID) end
+
+		if rCells_cf==0 then 
+			if grid:isInBounds(startX,curY_cf,startZ) then
+				local currentValue = grid:get(startX,curY_cf,startZ)
+				-- Logger:Trace("_createFormation_CenterCheck", "Cell (%d,%d,%d) value BEFORE set for centerline (rCells_cf=0) is: %s", startX,curY_cf,startZ, tostring(currentValue)) -- REMOVE OR MAKE TRACE
+				if currentValue == AIR then
+					grid:set(startX,curY_cf,startZ,SOLID) 
+					cellsSetThisYLevel = cellsSetThisYLevel + 1
+					-- Logger:Trace("_createFormation_SetCenter", ...) -- REMOVE THIS TRACE
+				end
+			end
+		end
+		totalCellsSetForThisFormation = totalCellsSetForThisFormation + cellsSetThisYLevel
+		-- Logger:Debug("_createFormation_LoopEnd", "Y-level %d. Cells set this Y-level: %d", curY_cf, cellsSetThisYLevel) -- Maybe remove or make TRACE
 		doYield()
 	end 
-end 
+	Logger:Debug("_createFormation_Exit", "EXITED: Start (%d,%d,%d), Type: %s. Total cells set for this one: %d", startX,startY,startZ,type, totalCellsSetForThisFormation) -- Keep Exit, add total count
+end
 
-local function Phase2_RockFormations() 
-	Logger:Info("Phase2", "Starting rock formations...")
+local function Phase_GrowRockFormations(skeletonDataReceived) 
+	Logger:Info("Phase_GrowRockFormations", "Starting rock formations...") 
+	-- Optional: Add the ConfigSnapshot log here if you want to verify config values at runtime
+	-- Logger:Info("Phase_GrowRockFormations_ConfigSnapshot", "BaseRadiusFactor: %.3f, ... MinDistTunnel: %d",
+	--    CaveConfig.BaseFormationRadius_Factor, ..., CaveConfig.FormationMinDistanceFromTunnel_Cells)
+
 	local sTime=os.clock()
 	local pSpots={}
 	local cForms={s=0,m=0,c=0}
+
+	local MIN_HORIZONTAL_AIR_NEIGHBORS = CaveConfig.FormationHorizontalMinAirNeighbors or 4
+	local MIN_DISTANCE_FROM_SKELETON_CELLS = CaveConfig.FormationMinDistanceFromTunnel_Cells or 0 
+
+	local function isTooCloseToSkeleton(checkPosVec3, skeletonData, minDistanceCells)
+		if not skeletonData or minDistanceCells <= 0 then return false end
+		local minDistanceSq = minDistanceCells * minDistanceCells
+		local pathsToConsider = {}
+		if skeletonData.trunkPath and #skeletonData.trunkPath > 0 then table.insert(pathsToConsider, skeletonData.trunkPath) end
+		if skeletonData.branchPaths then
+			for _, p in ipairs(skeletonData.branchPaths) do if p and #p > 0 then table.insert(pathsToConsider, p) end end
+		end
+		if skeletonData.spurPaths then 
+			for _, p in ipairs(skeletonData.spurPaths) do if p and #p > 0 then table.insert(pathsToConsider, p) end end
+		end
+		if skeletonData.extraLevelPaths then 
+			for _, levelData in ipairs(skeletonData.extraLevelPaths) do
+				if levelData and levelData.path and #levelData.path > 0 then table.insert(pathsToConsider, levelData.path) end
+			end
+		end
+		if #pathsToConsider == 0 then return false end 
+		for _, path in ipairs(pathsToConsider) do
+			for _, pointOnPath in ipairs(path) do
+				local differenceVector = pointOnPath - checkPosVec3
+				local distSq = differenceVector.X^2 + differenceVector.Y^2 + differenceVector.Z^2 
+				-- Or alternatively: local distSq = differenceVector:Dot(differenceVector)
+				if distSq < minDistanceSq then
+					return true 
+				end
+			end
+		end
+		return false 
+	end
 
 	for z_p2=2,gridSizeZ-1 do 
 		for x_p2=2,gridSizeX-1 do 
 			for y_p2=CaveConfig.FormationStartHeight_Cells+1,gridSizeY-1 do 
 				doYield()
+
+				local canProceedWithSpot = false -- Flag to control flow instead of goto
 				if grid:get(x_p2,y_p2,z_p2)==AIR then 
-					local rA=grid:get(x_p2,y_p2+1,z_p2)==SOLID
-					local rB=grid:get(x_p2,y_p2-1,z_p2)==SOLID
-					local clA,clB=true,true
+					local currentSpotPos = Vector3.new(x_p2, y_p2, z_p2) 
+
+					if not isTooCloseToSkeleton(currentSpotPos, skeletonDataReceived, MIN_DISTANCE_FROM_SKELETON_CELLS) then
+						canProceedWithSpot = true
+						-- else
+						-- Logger:Trace("Phase_GrowRockFormations_PathSkip", "Skipped spot (%d,%d,%d) - too close to a skeleton path.",x_p2,y_p2,z_p2)
+					end
+				end
+
+				if canProceedWithSpot then
+					local rA_isSolidAnchor = grid:get(x_p2,y_p2+1,z_p2)==SOLID 
+					local rB_isSolidAnchor = grid:get(x_p2,y_p2-1,z_p2)==SOLID 
+
+					local clA_hasVerticalClearance, clB_hasVerticalClearance = true,true
 					for i_cl=1,CaveConfig.FormationClearance_Cells do 
 						if not grid:isInBounds(x_p2,y_p2-i_cl,z_p2) or grid:get(x_p2,y_p2-i_cl,z_p2)==SOLID then 
-							clA=false; break 
+							clA_hasVerticalClearance=false; break 
 						end 
 					end 
 					for i_cl=1,CaveConfig.FormationClearance_Cells do 
 						if not grid:isInBounds(x_p2,y_p2+i_cl,z_p2) or grid:get(x_p2,y_p2+i_cl,z_p2)==SOLID then 
-							clB=false; break 
+							clB_hasVerticalClearance=false; break 
 						end 
-					end 
-					if rA and clA then table.insert(pSpots,{x=x_p2,y=y_p2,z=z_p2,type="stalactite"}) end
-					if rB and clB then table.insert(pSpots,{x=x_p2,y=y_p2,z=z_p2,type="stalagmite"}) end
-					if rA and rB then 
+					end
+
+					local function hasSufficientHorizontalClearance(x, y, z, minAirNeighbors)
+						local airNeighborCount = 0
+						local horizontalNeighbors = {
+							{1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1},
+							{1,0,1}, {-1,0,1}, {1,0,-1}, {-1,0,-1} 
+						}
+						for _, d in ipairs(horizontalNeighbors) do
+							if grid:isInBounds(x+d[1], y, z+d[3]) and grid:get(x+d[1], y, z+d[3]) == AIR then 
+								airNeighborCount = airNeighborCount + 1
+							end
+						end
+						return airNeighborCount >= minAirNeighbors
+					end
+
+					if rA_isSolidAnchor and clA_hasVerticalClearance then
+						if hasSufficientHorizontalClearance(x_p2, y_p2, z_p2, MIN_HORIZONTAL_AIR_NEIGHBORS) then
+							table.insert(pSpots,{x=x_p2,y=y_p2,z=z_p2,type="stalactite"}) 
+						end
+					end
+
+					if rB_isSolidAnchor and clB_hasVerticalClearance then
+						if hasSufficientHorizontalClearance(x_p2, y_p2, z_p2, MIN_HORIZONTAL_AIR_NEIGHBORS) then
+							table.insert(pSpots,{x=x_p2,y=y_p2,z=z_p2,type="stalagmite"}) 
+						end
+					end
+
+					if rA_isSolidAnchor and rB_isSolidAnchor then 
 						local fY,cY=y_p2,y_p2
 						while grid:isInBounds(x_p2,fY-1,z_p2) and grid:get(x_p2,fY-1,z_p2)==AIR do fY=fY-1 end
 						while grid:isInBounds(x_p2,cY+1,z_p2) and grid:get(x_p2,cY+1,z_p2)==AIR do cY=cY+1 end
@@ -549,39 +2223,64 @@ local function Phase2_RockFormations()
 							grid:isInBounds(x_p2,actCY,z_p2) and grid:get(x_p2,actCY,z_p2)==SOLID then
 							local airH=actCY-actFY-1
 							if airH>=CaveConfig.MinColumnHeight_Cells then 
-								table.insert(pSpots,{x=x_p2,y=(fY+cY)/2,z=z_p2,type="column",floorCellY=fY,ceilCellY=cY})
+								if hasSufficientHorizontalClearance(x_p2, y_p2, z_p2, MIN_HORIZONTAL_AIR_NEIGHBORS) then
+									local columnMidPointForCheck = Vector3.new(x_p2, math.floor((fY+cY)/2), z_p2)
+									if not isTooCloseToSkeleton(columnMidPointForCheck, skeletonDataReceived, MIN_DISTANCE_FROM_SKELETON_CELLS) then
+										table.insert(pSpots,{x=x_p2,y=columnMidPointForCheck.Y,z=z_p2,type="column",floorCellY=fY,ceilCellY=cY})
+										-- else
+										-- Logger:Trace("Phase_GrowRockFormations_PathSkip", "Skipped COLUMN spot (%d,%f,%d) - too close to skeleton.", x_p2, columnMidPointForCheck.Y, z_p2)
+									end
+								end
 							end 
 						end 
 					end 
-				end 
+				end -- End of if canProceedWithSpot
 			end 
 		end 
 	end 
-
+	Logger:Info("Phase_GrowRockFormations_Debug", "Found %d potential formation spots (after horizontal and skeleton proximity clearance).", #pSpots)
 	localShuffleTable(pSpots)
+
 	local fAtt=0
+	local formationsToCreateLimit = math.max(1, math.min(10, math.floor(#pSpots * 0.25)))
+	Logger:Debug("Phase_GrowRockFormations_LimitSet", "Formation create limit set to: %d (based on %d spots * 0.05)", formationsToCreateLimit, #pSpots)
+	local actualFormationsMadeThisRun = 0
+
 	for _,spt in ipairs(pSpots) do 
+		if actualFormationsMadeThisRun >= formationsToCreateLimit then 
+			Logger:Debug("Phase_GrowRockFormations_Debug", "Reached formationsToCreateLimit of %d. Stopping.", formationsToCreateLimit)
+			break 
+		end
+
 		fAtt=fAtt+1
+		Logger:Debug("Phase_GrowRockFormations_SPOT_DETAILS", "Processing Spot #%d: Type=%s, Coords=(%d,%d,%d). StalacChance=%.2f, StalagChance=%.2f, ColChance=%.2f", 
+			fAtt, spt.type, spt.x, spt.y, spt.z, CaveConfig.StalactiteChance, CaveConfig.StalagmiteChance, CaveConfig.ColumnChance)
 		if spt.type=="stalactite" and localRandomChance(CaveConfig.StalactiteChance) then 
+			Logger:Debug("Phase_GrowRockFormations_Debug", "Attempting ONE stalactite at %d,%d,%d", spt.x,spt.y,spt.z)
 			_createFormation(spt.x,spt.y,spt.z,"stalactite",nil);cForms.s=cForms.s+1
+			actualFormationsMadeThisRun = actualFormationsMadeThisRun + 1 
 		elseif spt.type=="stalagmite" and localRandomChance(CaveConfig.StalagmiteChance) then 
+			Logger:Debug("Phase_GrowRockFormations_Debug", "Attempting ONE stalagmite at %d,%d,%d", spt.x,spt.y,spt.z)
 			_createFormation(spt.x,spt.y,spt.z,"stalagmite",nil);cForms.m=cForms.m+1
+			actualFormationsMadeThisRun = actualFormationsMadeThisRun + 1
 		elseif spt.type=="column" and localRandomChance(CaveConfig.ColumnChance) then 
 			if spt.floorCellY and spt.ceilCellY then 
+				Logger:Debug("Phase_GrowRockFormations_Debug", "Attempting ONE column at %d,%d,%d", spt.x,spt.y,spt.z) 
 				_createFormation(spt.x,spt.floorCellY,spt.z,"column",spt.ceilCellY);cForms.c=cForms.c+1 
+				actualFormationsMadeThisRun = actualFormationsMadeThisRun + 1
 			else  
-				Logger:Debug("Phase2", "Invalid column spot data for attempted creation at (%d,%d,%d)",spt.x,spt.y,spt.z)
+				Logger:Warn("Phase_GrowRockFormations_Debug", "Invalid column spot data for attempted creation at (%d,%d,%d), FloorY: %s, CeilY: %s",
+					spt.x,spt.y,spt.z, tostring(spt.floorCellY), tostring(spt.ceilCellY))
 			end 
 		end 
-		doYield()
 	end 
-	Logger:Debug("Phase2", "Spots processed: %d, Formation creation attempted: %d", #pSpots, fAtt)
-	Logger:Info("Phase2", "Created S:%d, M:%d, C:%d.",cForms.s,cForms.m,cForms.c)
+	Logger:Debug("Phase_GrowRockFormations", "Spots processed up to limit: %d. Actual Formations Created: %d", fAtt, actualFormationsMadeThisRun)
+	Logger:Info("Phase_GrowRockFormations", "Created (attempted under limit) S:%d, M:%d, C:%d.",cForms.s,cForms.m,cForms.c)
 	local eTime=os.clock()
-	Logger:Info("Phase2", "Finished! Time: %.2fs", eTime-sTime)
-end 
+	Logger:Info("Phase_GrowRockFormations", "Finished! Time: %.2fs", eTime-sTime)
+end
 
-local function Phase3_Smoothing()
+local function Phase_ApplySmoothing()
 	Logger:Info("Phase3", "Starting smoothing...")
 	local sTime=os.clock()
 	for iter=1,CaveConfig.SmoothingIterations do 
@@ -833,7 +2532,7 @@ local function _carveTunnel_local_p46(p1,p2,radiusFactor)
 	Logger:Trace("_carveTunnel", "Tunnel done. Approx %d cells carved to AIR.",cellsCT)
 end 
 
-local function Phase4_EnsureConnectivity()
+local function Phase_EnsureMainConnectivity()
 	Logger:Info("Phase4", "Starting ensure connectivity...")
 	local sTime=os.clock()
 	local airCs=_findAirComponents_local_p45() 
@@ -923,7 +2622,7 @@ local function Phase4_EnsureConnectivity()
 	Logger:Info("Phase4", "Finished! Time: %.2fs. Connections made: %d", eTime-sTime, connsMade)
 end
 
-local function Phase5_FloodFillCleanup()
+local function Phase_CleanupIsolatedAir()
 	Logger:Info("Phase5", "Starting flood fill cleanup...")
 	local sTime=os.clock()
 	local airCs_p5=_findAirComponents_local_p45() 
@@ -958,7 +2657,7 @@ local function Phase5_FloodFillCleanup()
 	Logger:Info("Phase5", "Finished! Time: %.2fs", eTime-sTime)
 end
 
-local function Phase6_SurfaceEntrances()
+local function Phase_CreateSurfaceEntrances()
 	Logger:Info("Phase6", "Starting surface entrances...")
 	local sTime=os.clock()
 	local entrMade_p6=0
@@ -966,7 +2665,16 @@ local function Phase6_SurfaceEntrances()
 		local sx_p6e,sz_p6e,sy_p6e = localRandomInt(3,gridSizeX-2),localRandomInt(3,gridSizeZ-2),gridSizeY-2 
 		local cPos_p6e={x=sx_p6e,y=sy_p6e,z=sz_p6e}
 		local tY_p6e=CaveConfig.FormationStartHeight_Cells+localRandomInt(3,10)
-		local len_p6e,maxL_p6e = 0, localRandomInt(CaveConfig.SurfaceCaveTunnelLength_Cells_MinMax[1],CaveConfig.SurfaceCaveTunnelLength_Cells_MinMax[2])
+		local minTunnelLen = CaveConfig.SurfaceCaveTunnelLength_Cells_MinMax.min
+		local maxTunnelLen = CaveConfig.SurfaceCaveTunnelLength_Cells_MinMax.max
+
+		if type(minTunnelLen) ~= "number" or type(maxTunnelLen) ~= "number" then
+			Logger:Error("Phase6_ConfigErr", "SurfaceCaveTunnelLength_Cells_MinMax.min or .max is nil or not a number! Using defaults. Min: %s, Max: %s", tostring(minTunnelLen), tostring(maxTunnelLen))
+			minTunnelLen = 20 -- Default fallback
+			maxTunnelLen = 45 -- Default fallback
+		end
+		local maxL_p6e = localRandomInt(minTunnelLen, maxTunnelLen)
+		local len_p6e = 0
 		local conn_p6e=false
 
 		while cPos_p6e.y>tY_p6e and len_p6e<maxL_p6e and cPos_p6e.y>2 do 
@@ -1089,7 +2797,7 @@ local function _buildBridge_local(p1,p2)
 	Logger:Trace("_buildBridge", "Bridge built between (%s,%s,%s) and (%s,%s,%s). Approx %d cells set to SOLID.", p1.x,p1.y,p1.z, p2.x,p2.y,p2.z, cellsSet)
 end 
 
-local function Phase7_Bridges() 
+local function Phase_BuildBridges() 
 	Logger:Info("Phase7", "Starting bridges...")
 	local sTime_p7 = os.clock()
 	local bridgeCandidates_p7_list = {}
@@ -1357,11 +3065,6 @@ end
 local AXIAL_DIRECTIONS = {Vector3.new(1,0,0), Vector3.new(-1,0,0),Vector3.new(0,1,0), Vector3.new(0,-1,0),Vector3.new(0,0,1), Vector3.new(0,0,-1)}
 local AXIAL_DIRECTIONS_MAP = {[Vector3.new(1,0,0)]=true, [Vector3.new(-1,0,0)]=true,[Vector3.new(0,1,0)]=true, [Vector3.new(0,-1,0)]=true,[Vector3.new(0,0,1)]=true, [Vector3.new(0,0,-1)]=true,}
 
-local function rotateVectorAroundAxis(vecToRotate, axis, angleRadians)
-	local rotationCFrame = CFrame.fromAxisAngle(axis.Unit, angleRadians)
-	return (rotationCFrame * vecToRotate)
-end
-
 local function getOrthogonalAxialDirections(dirVec, avoidReverse)
 	local orthos = {}
 	for _, axialDir in ipairs(AXIAL_DIRECTIONS) do
@@ -1401,7 +3104,7 @@ local function Phase_AgentTunnels()
 	local nextAgentId_pat = 1 -- Use a phase-specific nextAgentId to avoid conflict with the global one if it existed.
 	-- Your 'nextAgentId' was already local to the function, so this is just to be extra clear.
 
-	local YIELD_AGENT_BATCH_SIZE = 10; local agentProcessingCounter = 0  
+	local YIELD_AGENT_BATCH_SIZE = 2; local agentProcessingCounter = 0 -- More frequent yields 
 
 	for i = 1, CaveConfig.AgentTunnels_NumInitialAgents do
 		local startPosGrid = nil 
@@ -1585,6 +3288,7 @@ end
 -- VI. MAIN EXECUTION
 -- =============================================================================
 local function RunCaveGeneration()
+	Logger:Info("RunCaveGen_ENTRY", "RunCaveGeneration function has been entered.")
 	Logger:Info("RunCaveGen", "--- SCRIPT EXECUTION STARTED ---")
 	-- Terrain and CaveConfig checks now done at the very top after Logger setup
 
@@ -1612,24 +3316,72 @@ local function RunCaveGeneration()
 	local overallStartTime=os.clock()
 	local errorInPhase=false
 
+	local skeletonOutputFromPhase0 = nil -- To store data from Phase0
+
 	local phasesToRun={
-		{name="Phase1_InitialCaveFormation",func=Phase1_InitialCaveFormation,enabled=true},
-		{name="Phase2_RockFormations",func=Phase2_RockFormations,enabled=CaveConfig.FormationPhaseEnabled},
-		{name="Phase3_Smoothing",func=Phase3_Smoothing,enabled=CaveConfig.SmoothingPhaseEnabled},
-		{name="Phase4_EnsureConnectivity",func=Phase4_EnsureConnectivity,enabled=CaveConfig.ConnectivityPhaseEnabled},
-		{name="Phase5_FloodFillCleanup",func=Phase5_FloodFillCleanup,enabled=CaveConfig.FloodFillPhaseEnabled},
-		{name="Phase_AgentTunnels", func=Phase_AgentTunnels, enabled=CaveConfig.AgentTunnels_Enabled},
-		{name="Phase6_SurfaceEntrances",func=Phase6_SurfaceEntrances,enabled=CaveConfig.SurfaceEntrancesPhaseEnabled},
-		{name="Phase7_Bridges",func=Phase7_Bridges,enabled=CaveConfig.BridgePhaseEnabled},
+		{name="Phase_CarveSkeleton",func=Phase_CarveSkeleton,enabled=true},
+		{name="Phase_ConnectLoops",func=Phase_ConnectLoops,enabled=true},
+		{name="Phase_GenerateMultiLevels",func=Phase_GenerateMultiLevels,enabled=true},
+		{name="Phase_VaryPassageWidths",func=Phase_VaryPassageWidths,enabled=true},
+		{name="Phase_CarveChambers",func=Phase_CarveChambers,enabled=true},   
+		{name="Phase_MesoDetailing",func=Phase_MesoDetailing,enabled=true},
+		{name="Phase_GrowRockFormations",func=Phase_GrowRockFormations,enabled=true}, 
+		{name="Phase_InitialNoiseCarve",func=Phase_InitialNoiseCarve,enabled=false}, -- Likely keep disabled
+		{name="Phase_ApplySmoothing",func=Phase_ApplySmoothing,enabled=true},        
+		{name="Phase_EnsureMainConnectivity",func=Phase_EnsureMainConnectivity,enabled=true},
+		{name="Phase_CleanupIsolatedAir",func=Phase_CleanupIsolatedAir,enabled=true}, 
+		{name="Phase_AgentTunnels", func=Phase_AgentTunnels, enabled=true},   
+		{name="Phase_CreateSurfaceEntrances",func=Phase_CreateSurfaceEntrances,enabled=true},
+		{name="Phase_BuildBridges",func=Phase_BuildBridges,enabled=true},             
 		{name="Phase8_BuildWorld",func=Phase8_BuildWorld,enabled=true}
 	}
 
 	for i,phaseInfo in ipairs(phasesToRun) do 
 		if phaseInfo.enabled then 
 			Logger:Info("RunCaveGen", "--- Starting phase: %s ---", phaseInfo.name)
-			local success,errMsgOrResult = pcall(phaseInfo.func) 
+			local success, resultOrError
+
+			-- Special handling for PRE/POST logging and passing skeleton data
+			local preAir, preSolid = -1, -1
+			local shouldLogCounts = Logger:IsLevelEnabled(Logger.Levels.DEBUG) and 
+					(phaseInfo.name == "Phase_CarveSkeleton" or -- Keep for first major carving
+					-- phaseInfo.name == "Phase_CarveChambers" or -- Maybe remove for now
+					phaseInfo.name == "Phase_CleanupIsolatedAir" or -- Useful after cleanup
+					phaseInfo.name == "Phase_GrowRockFormations") -- Useful for formation deltas
+
+			if shouldLogCounts then
+				preAir, preSolid = CountCellTypesInGrid(grid)
+				Logger:Debug("RunCaveGen_COUNTS", "PRE-%s: AIR cells = %d, SOLID cells = %d", phaseInfo.name, preAir, preSolid)
+			end
+
+			-- Call the phase function
+			if phaseInfo.name == "Phase_CarveSkeleton" then
+				success, resultOrError = pcall(phaseInfo.func)
+				if success then skeletonOutputFromPhase0 = resultOrError 
+				else skeletonOutputFromPhase0 = nil end
+			elseif phaseInfo.name == "Phase_ConnectLoops" or 
+				   phaseInfo.name == "Phase_GenerateMultiLevels" or 
+				   phaseInfo.name == "Phase_VaryPassageWidths" or 
+				   phaseInfo.name == "Phase_CarveChambers" or
+				   phaseInfo.name == "Phase_MesoDetailing" or
+				   phaseInfo.name == "Phase_GrowRockFormations" then -- Added GrowRockFormations here
+				
+				if not skeletonOutputFromPhase0 then 
+					Logger:Warn("RunCaveGen", "Skeleton data for %s is nil. Passing nil.", phaseInfo.name)
+				end
+				success, resultOrError = pcall(phaseInfo.func, skeletonOutputFromPhase0)
+				if success and phaseInfo.name == "Phase_GenerateMultiLevels" and resultOrError then
+					skeletonOutputFromPhase0 = resultOrError -- Capture potentially modified skeletonData
+					Logger:Debug("RunCaveGen", "Phase_GenerateMultiLevels output captured. Extra Level Paths: %d", 
+						(skeletonOutputFromPhase0 and skeletonOutputFromPhase0.extraLevelPaths and #skeletonOutputFromPhase0.extraLevelPaths) or 0)
+				end
+			else 
+				success, resultOrError = pcall(phaseInfo.func)
+			end
+
+			-- Post-call processing
 			if not success then 
-				local errMsg = errMsgOrResult 
+				local errMsg = resultOrError 
 				Logger:Error("RunCaveGen", "--- ERROR in %s: %s ---", phaseInfo.name, tostring(errMsg))
 				if errMsg and type(errMsg)=="string" then 
 					Logger:Error("RunCaveGen", "Stack trace for %s:\n%s", phaseInfo.name, debug.traceback(errMsg,2))
@@ -1639,20 +3391,27 @@ local function RunCaveGeneration()
 				errorInPhase=true; break 
 			else 
 				Logger:Info("RunCaveGen", "--- Finished phase: %s ---", phaseInfo.name)
-				if Logger:IsLevelEnabled(Logger.Levels.DEBUG) then
-					if phaseInfo.name == "Phase1_InitialCaveFormation" or 
-						phaseInfo.name == "Phase2_RockFormations" or
-						phaseInfo.name == "Phase3_Smoothing" or
-						phaseInfo.name == "Phase5_FloodFillCleanup" or
-						phaseInfo.name == "Phase_AgentTunnels" or 
-						phaseInfo.name == "Phase6_SurfaceEntrances" then
-						local airCount, solidCount = CountCellTypesInGrid(grid)
-						Logger:Debug("RunCaveGen", "POST-%s: AIR cells = %d, SOLID cells = %d", phaseInfo.name, airCount, solidCount)
+				if shouldLogCounts then
+					local postAir, postSolid = CountCellTypesInGrid(grid)
+					local deltaAir = postAir - preAir
+					local deltaSolid = postSolid - preSolid
+					Logger:Debug("RunCaveGen_COUNTS", "POST-%s: AIR cells = %d, SOLID cells = %d. DELTA_AIR: %d, DELTA_SOLID: %d", 
+						phaseInfo.name, postAir, postSolid, deltaAir, deltaSolid)
+					
+					-- Specific check for Phase_GrowRockFormations delta based on ONE formation
+					if phaseInfo.name == "Phase_GrowRockFormations" then
+						if deltaSolid < 0 then -- Only warn if it somehow *removes* solid
+							Logger:Warn("RunCaveGen_COUNTS", "POST-%s: UNEXPECTED NEGATIVE DELTA_SOLID of %d!", phaseInfo.name, deltaSolid)
+						end
+						if deltaAir ~= -deltaSolid then
+							Logger:Warn("RunCaveGen_COUNTS", "POST-%s: UNEXPECTED DELTA_AIR! Delta Air (%d) is not the negative of Delta Solid (%d). Check logic.", 
+								phaseInfo.name, deltaAir, deltaSolid)
+						end
 					end
 				end
 			end
 		else 
-			Logger:Info("RunCaveGen", "--- Skipping phase: %s (disabled in CaveConfig) ---", phaseInfo.name)
+			Logger:Info("RunCaveGen", "--- Skipping phase: %s (not enabled or config missing) ---", phaseInfo.name)
 		end
 	end
 
@@ -1665,7 +3424,8 @@ local function RunCaveGeneration()
 	end
 	Logger:Info("RunCaveGen", "Total script execution time: %.2fs", overallEndTime-overallStartTime)
 	Logger:Info("RunCaveGen", "-----------------------------------------------------")
-end -- End RunCaveGeneration
+	end -- End RunCaveGeneration
+
 
 task.wait(3)
 Logger:Info("MainScript", "--- CaveGenerator Script: Calling RunCaveGeneration ---")
