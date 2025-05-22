@@ -110,20 +110,21 @@ Config.PathGeneration = {
 		CarveInitialClearanceAtStart = false,
 		InitialClearanceRadiusCells = 0
 	},
-	LoopConnector = { -- Ensure this table NAME is correct
-		SegmentBaseLengthStuds = 10, -- Ensure this field exists
-		PathPerlin_MaxTurnDeg = 28,  -- << ERROR IS HERE IF THIS FIELD IS MISSING/MISSPELLED
+	LoopConnector = { 
+		SegmentBaseLengthStuds = 10, -- Numeric value
+		PathPerlin_MaxTurnDeg = 28,  -- <<< THIS FIELD (or similar) IS CRITICAL
 		PathPerlin_YawNoiseScale = 0.03,
 		PathPerlin_YawStrengthFactor = 0.9,
 		PathPerlin_PitchNoiseScale = 0.035,
 		PathPerlin_PitchStrengthFactor = 0.45,
-		RadiusVarianceNoiseScale = 0.055,
-		RadiusVarianceFactor = 0.15,
+		-- These dynamic parameters are for _generateWindingPath_PerlinAdvanced:
+		RadiusVarianceNoiseScale = 0.055, 
+		RadiusVarianceFactor = 0.15,   
 		TurnTendencyNoiseScale = 0.045,
 		TurnTendencyVariance = 0.25,
-
+		-- These are specific to Phase_ConnectLoops itself:
 		RadiusStuds_MinMax = {min = 3, max = 5}, 
-		MaxDistanceStuds = 90                    
+		MaxDistanceStuds = 90                   
 	},
 	-- MultiLevel_Trunk_PathPerlin = { ... } -- Define if making multi-level trunks also use PerlinAdvanced
 }
